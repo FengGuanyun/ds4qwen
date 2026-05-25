@@ -2,9 +2,9 @@
 
 ## 现状
 
-- **基准速度**: ~196ms/token (5-step decode) / ~215ms/token (30-step avg)
+- **基准速度**: ~168ms/token (5-step decode) / ~183ms/token (30-step avg)
 - **目标速度**: 50ms/token (20 tok/s)
-- **差距**: ~4x
+- **差距**: ~3.4x
 - **GPU 内存**: ~490MB (非瓶颈)
 - **每 token GPU 函数调用数**: ~36+ (每层 8-11 次 dispatch × 64 层)
 - **模型**: Qwen3.6-27B Hybrid (64 layers, 32 DeltaNet + 32 Attention)
@@ -23,6 +23,8 @@
 | 8 | FP16 激活转换 | 收益为负(已回退) | REJECTED |
 | 9 | 融合 DeltaNet 4×Q4_K matmul | ~12ms | DONE |
 | 10 | 融合 FFN gate+up matmul | ~2ms | DONE |
+| 11 | 融合 Attention QKV 投影 | ~3ms | DONE |
+| 12 | In-encoder tensor_copy (消除 7 个同步点) | ~28ms | DONE |
 
 ## 待优化项（按预期收益排序）
 
@@ -34,10 +36,8 @@
 **参考**: ds4 使用 `metal_graph_eval_token_raw_swa` 实现 graph replay。
 **优先级**: 最高 — 达到 50ms/token 的必经之路，预计带来 2-3x 提升。
 
-#### 2. 融合 Attention QKV 投影（预期 ~10-15ms 收益）
-**问题**: Attention 层 3 次独立 matmul（Q=12288, K=1024, V=1024），32 层 = 96 次 dispatch。
-**方案**: 用 fused4 kernel 合并为 1 次 dispatch/层，省 64 次 dispatch。
-**难点**: Q 和 KV 输出维度差异大（12288 vs 1024），需优化 fused kernel 的 threadgroup 分配，避免浪费计算。
+#### 2. ~~融合 Attention QKV 投影~~
+**状态**: 已完成，收益 ~3ms（64 dispatch 节省）
 
 #### 3. 融合 FFN down + residual add（预期 ~5ms 收益）
 **问题**: FFN 路径 `mid → down matmul → residual add`，两次 dispatch。
@@ -57,10 +57,9 @@
 - 对 small batch 使用更高效的线程布局
 - KV cache 增长时性能下降明显（196ms → 215ms over 30 steps）
 
-#### 6. 减少 tensor_copy 的 per-call 开销（预期 ~5ms 收益）
-**问题**: `q4_gpu_tensor_copy` 每次创建独立 MTLCommandBuffer（commit → wait），硬同步点。
-**方案**: 在同一个 encoder 内完成数据搬运（blit 或 compute copy），避免同步。
-**注意**: 此前尝试 batching 导致 encoder 冲突崩溃，需要更谨慎的 encoder 管理。
+#### 6. ~~减少 tensor_copy 的 per-call 开销~~
+**状态**: 已完成，收益 ~28ms（消除 7 个 GPU 同步点）
+**方案**: 用 compute kernel `kernel_tensor_copy` 在 active encoder 内执行，替代 standalone blit command buffer。
 
 ### Tier 3: 小收益
 
@@ -93,9 +92,9 @@
 - Metal dispatch overhead 约 10-50μs/call
 
 ### KV cache 增长影响
-- 5-step: 196ms/token
-- 10-step: 199ms/token
-- 30-step: 215ms/token（attention 计算量随 kv_len 线性增长）
+- 5-step: 168ms/token
+- 10-step: 168ms/token
+- 30-step: 183ms/token（attention 计算量随 kv_len 线性增长）
 
 ## 文件索引
 
