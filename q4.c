@@ -2814,45 +2814,54 @@ static int q4_gpu_forward(q4_engine *e, q4_session *s, int token, uint32_t pos, 
             const uint64_t z_raw_bytes = (uint64_t)Q4_N_V_HEADS * Q4_HEAD_V_DIM * sizeof(float); /* 24576 */
             const uint64_t expand_bytes = z_raw_bytes;                                       /* 24576 each */
 
-            uint64_t qkv_off = gpu_scratch_alloc(s, qkv_raw_bytes);
-            uint64_t alpha_off = gpu_scratch_alloc(s, small_bytes);
-            uint64_t beta_off = gpu_scratch_alloc(s, small_bytes);
             uint64_t gate_off = gpu_scratch_alloc(s, small_bytes);
             uint64_t beta_sig_off = gpu_scratch_alloc(s, small_bytes);
-            uint64_t z_off = gpu_scratch_alloc(s, z_raw_bytes);
             uint64_t q_exp_off = gpu_scratch_alloc(s, expand_bytes);
             uint64_t k_exp_off = gpu_scratch_alloc(s, expand_bytes);
             uint64_t v_off = gpu_scratch_alloc(s, expand_bytes);
             uint64_t delta_out_off = gpu_scratch_alloc(s, expand_bytes);
             uint64_t proj_off = gpu_scratch_alloc(s, embd_bytes);
 
-            q4_gpu_tensor *qkv_raw_t = gpu_scratch_view(s, qkv_off, qkv_raw_bytes);
-            q4_gpu_tensor *alpha_raw_t = gpu_scratch_view(s, alpha_off, small_bytes);
-            q4_gpu_tensor *beta_raw_t = gpu_scratch_view(s, beta_off, small_bytes);
             q4_gpu_tensor *gate_t = gpu_scratch_view(s, gate_off, small_bytes);
             q4_gpu_tensor *beta_sig_t = gpu_scratch_view(s, beta_sig_off, small_bytes);
-            q4_gpu_tensor *z_raw_t = gpu_scratch_view(s, z_off, z_raw_bytes);
             q4_gpu_tensor *q_exp_t = gpu_scratch_view(s, q_exp_off, expand_bytes);
             q4_gpu_tensor *k_exp_t = gpu_scratch_view(s, k_exp_off, expand_bytes);
             q4_gpu_tensor *v_raw_t = gpu_scratch_view(s, v_off, expand_bytes);
             q4_gpu_tensor *delta_out_t = gpu_scratch_view(s, delta_out_off, expand_bytes);
             q4_gpu_tensor *proj_t = gpu_scratch_view(s, proj_off, embd_bytes);
 
-            /* 1. qkv_raw = normed @ attn_qkv (Q4_K) */
-            /* 2. alpha_raw = normed @ ssm_alpha (Q4_K) */
-            /* 3. beta_raw = normed @ ssm_beta (Q4_K) */
-            /* 4. z_raw = normed @ attn_gate (Q4_K) */
-            if (q4_gpu_matmul_q4_k_tensor(qkv_raw_t, model_map, model_size,
-                    l->attn_qkv->abs_offset, n_embd, Q4_QKV_DIM, s->gpu_normed, 1) != 0 ||
-                q4_gpu_matmul_q4_k_tensor(alpha_raw_t, model_map, model_size,
-                    l->ssm_alpha->abs_offset, n_embd, Q4_N_V_HEADS, s->gpu_normed, 1) != 0 ||
-                q4_gpu_matmul_q4_k_tensor(beta_raw_t, model_map, model_size,
-                    l->ssm_beta->abs_offset, n_embd, Q4_N_V_HEADS, s->gpu_normed, 1) != 0 ||
-                q4_gpu_matmul_q4_k_tensor(z_raw_t, model_map, model_size,
-                    l->attn_gate->abs_offset, n_embd, Q4_N_V_HEADS * Q4_HEAD_V_DIM, s->gpu_normed, 1) != 0) {
-                if (err && errlen > 0) snprintf(err, errlen, "layer %u DeltaNet matmuls failed", il);
+            /* 1-4. Fused: qkv_raw, alpha_raw, beta_raw, z_raw = normed @ [attn_qkv, ssm_alpha, ssm_beta, attn_gate] (Q4_K) */
+            /* Output buffer layout: scratch space must hold qkv_raw(10240) + alpha_raw(48) + beta_raw(48) + z_raw(6144) = 16280 floats */
+            /* But our scratch tensors are separate, so we need a combined output buffer.
+             * Instead, we compute all 4 into a single large scratch region, then create views. */
+            const uint64_t fused_out_bytes = (Q4_QKV_DIM + Q4_N_V_HEADS + Q4_N_V_HEADS + Q4_N_V_HEADS * Q4_HEAD_V_DIM) * sizeof(float);
+            uint64_t fused_off = gpu_scratch_alloc(s, fused_out_bytes);
+            q4_gpu_tensor *fused_out_t = gpu_scratch_view(s, fused_off, fused_out_bytes);
+
+            const uint64_t fused_weights[4] = {
+                l->attn_qkv->abs_offset,
+                l->ssm_alpha->abs_offset,
+                l->ssm_beta->abs_offset,
+                l->attn_gate->abs_offset,
+            };
+            const uint32_t fused_out_dims[4] = {
+                Q4_QKV_DIM, Q4_N_V_HEADS, Q4_N_V_HEADS, Q4_N_V_HEADS * Q4_HEAD_V_DIM,
+            };
+            if (q4_gpu_matmul_q4_k_fused4_tensor(fused_out_t, model_map, model_size,
+                    fused_weights, fused_out_dims, n_embd, s->gpu_normed) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u DeltaNet fused matmuls failed", il);
                 return -1;
             }
+
+            /* Create views into the fused output for downstream kernels */
+            const uint64_t qkv_float_off = 0;
+            const uint64_t alpha_float_off = Q4_QKV_DIM;
+            const uint64_t beta_float_off = Q4_QKV_DIM + Q4_N_V_HEADS;
+            const uint64_t z_float_off = Q4_QKV_DIM + Q4_N_V_HEADS + Q4_N_V_HEADS;
+            q4_gpu_tensor *qkv_raw_t = q4_gpu_tensor_view(fused_out_t, qkv_float_off * sizeof(float), qkv_raw_bytes);
+            q4_gpu_tensor *alpha_raw_t = q4_gpu_tensor_view(fused_out_t, alpha_float_off * sizeof(float), small_bytes);
+            q4_gpu_tensor *beta_raw_t = q4_gpu_tensor_view(fused_out_t, beta_float_off * sizeof(float), small_bytes);
+            q4_gpu_tensor *z_raw_t = q4_gpu_tensor_view(fused_out_t, z_float_off * sizeof(float), z_raw_bytes);
 
             /* 5. conv1D + split + L2 norm + expand */
             const uint64_t layer_conv_off = il * Q4_CONV_KERNEL * Q4_QKV_DIM * sizeof(float);
@@ -2915,14 +2924,7 @@ static int q4_gpu_forward(q4_engine *e, q4_session *s, int token, uint32_t pos, 
             /* 11. Update conv_pos */
             s->conv_pos[il] = (s->conv_pos[il] + 1) % Q4_CONV_KERNEL;
 
-            /* 12. Read back SSM state from GPU tensor to CPU (needed for next token / session save) */
-            {
-                float *layer_ssm_state = s->ssm_state + il * Q4_N_V_HEADS * Q4_HEAD_V_DIM * Q4_HEAD_K_DIM;
-                const uint64_t state_bytes = Q4_N_V_HEADS * Q4_HEAD_V_DIM * Q4_HEAD_K_DIM * sizeof(float);
-                const uint64_t layer_state_off = il * state_bytes;
-                q4_gpu_tensor *state_view = q4_gpu_tensor_view(s->gpu_ssm_state, layer_state_off, state_bytes);
-                q4_gpu_tensor_read(state_view, 0, layer_ssm_state, state_bytes);
-            }
+            /* SSM state stays on GPU between tokens — only read back at session save time. */
         } else {
             /* --- Gated Attention --- */
             /* Allocate scratch for Q, K, V */
@@ -3047,17 +3049,41 @@ skip_post_attn_norm:
         /* FFN: gate = normed @ ffn_gate (Q4_K), up = normed @ ffn_up (Q4_K)
          * mid = SiLU(clamp(gate)) * up, then ffn_out = mid @ ffn_down
          * Since shared kernel only supports Q8_0, do separate matmuls + elementwise. */
-        uint64_t gate_off = gpu_scratch_alloc(s, ffn_bytes);
-        uint64_t up_off = gpu_scratch_alloc(s, ffn_bytes);
-        q4_gpu_tensor *gate_t = gpu_scratch_view(s, gate_off, ffn_bytes);
-        q4_gpu_tensor *up_t = gpu_scratch_view(s, up_off, ffn_bytes);
 
-        if (q4_gpu_matmul_any_tensor(gate_t, model_map, model_size, l->ffn_gate->abs_offset,
-                n_embd, Q4_N_FFN, l->ffn_gate->type, s->gpu_normed, 1) != 0 ||
-            q4_gpu_matmul_any_tensor(up_t, model_map, model_size, l->ffn_up->abs_offset,
-                n_embd, Q4_N_FFN, l->ffn_up->type, s->gpu_normed, 1) != 0) {
-            if (err && errlen > 0) snprintf(err, errlen, "layer %u FFN gate/up failed", il);
-            return -1;
+        /* Check if both FFN gate and up are Q4_K for fused matmul */
+        q4_gpu_tensor *gate_t, *up_t;
+        if (l->ffn_gate->type == Q4_TENSOR_Q4_K && l->ffn_up->type == Q4_TENSOR_Q4_K) {
+            /* Fused gate+up: 2 matmuls from same input in one dispatch */
+            const uint64_t fused_ffn_bytes = (uint64_t)Q4_N_FFN * 2 * sizeof(float);
+            uint64_t fused_ffn_off = gpu_scratch_alloc(s, fused_ffn_bytes);
+            q4_gpu_tensor *fused_ffn_t = gpu_scratch_view(s, fused_ffn_off, fused_ffn_bytes);
+
+            const uint64_t ffn_weights[4] = {
+                l->ffn_gate->abs_offset, l->ffn_up->abs_offset, 0, 0,
+            };
+            const uint32_t ffn_dims[4] = { Q4_N_FFN, Q4_N_FFN, 0, 0 };
+            if (q4_gpu_matmul_q4_k_fused4_tensor(fused_ffn_t, model_map, model_size,
+                    ffn_weights, ffn_dims, n_embd, s->gpu_normed) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u FFN fused gate/up failed", il);
+                return -1;
+            }
+
+            gate_t = q4_gpu_tensor_view(fused_ffn_t, 0, ffn_bytes);
+            up_t = q4_gpu_tensor_view(fused_ffn_t, (uint64_t)Q4_N_FFN * sizeof(float), ffn_bytes);
+        } else {
+            /* Fallback: separate matmuls for non-Q4_K weights */
+            uint64_t gate_off = gpu_scratch_alloc(s, ffn_bytes);
+            uint64_t up_off = gpu_scratch_alloc(s, ffn_bytes);
+            gate_t = gpu_scratch_view(s, gate_off, ffn_bytes);
+            up_t = gpu_scratch_view(s, up_off, ffn_bytes);
+
+            if (q4_gpu_matmul_any_tensor(gate_t, model_map, model_size, l->ffn_gate->abs_offset,
+                    n_embd, Q4_N_FFN, l->ffn_gate->type, s->gpu_normed, 1) != 0 ||
+                q4_gpu_matmul_any_tensor(up_t, model_map, model_size, l->ffn_up->abs_offset,
+                    n_embd, Q4_N_FFN, l->ffn_up->type, s->gpu_normed, 1) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u FFN gate/up failed", il);
+                return -1;
+            }
         }
 
         /* Fused SiLU+mul on GPU: gate_t = SiLU(clamp(gate_t)) * up_t */
@@ -3089,10 +3115,7 @@ skip_post_attn_norm:
             return -1;
         }
 
-        if (il % 16 == 0) fprintf(stderr, "GPU_DBG: layer %u done\n", il);
     }
-
-    fprintf(stderr, "GPU_DBG: all layers done\n");
 
     /* --- Final RMSNorm --- */
     if (q4_gpu_rms_norm_weight_rows_tensor(s->gpu_normed, s->gpu_hidden,

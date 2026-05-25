@@ -151,6 +151,14 @@ void q4_gpu_cleanup(void) {
 }
 
 /* =========================================================================
+ * Command Batching (declarations before tensor lifecycle so q4_gpu_tensor_copy
+ * can use g_encoder and g_cmd_buffer).
+ * ========================================================================= */
+
+static id<MTLCommandBuffer> g_cmd_buffer;
+static id<MTLComputeCommandEncoder> g_encoder;
+
+/* =========================================================================
  * Tensor Lifecycle.
  * ========================================================================= */
 
@@ -226,9 +234,9 @@ int q4_gpu_tensor_copy(q4_gpu_tensor *dst, uint64_t dst_offset,
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
     [blit copyFromBuffer:src->buffer
-            sourceOffset:src_offset
+            sourceOffset:src->offset + src_offset
                 toBuffer:dst->buffer
-           destinationOffset:dst_offset
+           destinationOffset:dst->offset + dst_offset
                        size:bytes];
     [blit endEncoding];
     [cb commit];
@@ -239,9 +247,6 @@ int q4_gpu_tensor_copy(q4_gpu_tensor *dst, uint64_t dst_offset,
 /* =========================================================================
  * Command Batching.
  * ========================================================================= */
-
-static id<MTLCommandBuffer> g_cmd_buffer;
-static id<MTLComputeCommandEncoder> g_encoder;
 
 int q4_gpu_begin_commands(void) {
     if (g_encoder) {
@@ -356,7 +361,9 @@ static id<MTLComputePipelineState> make_pipeline(const char *name) {
 
 static void ensure_encoder(const char *name) {
     if (!g_encoder) {
-        g_cmd_buffer = [g_queue commandBuffer];
+        if (!g_cmd_buffer) {
+            g_cmd_buffer = [g_queue commandBuffer];
+        }
         g_encoder = [g_cmd_buffer computeCommandEncoder];
     }
 }
@@ -829,10 +836,10 @@ int q4_gpu_kv_cache_store_tensor(
 
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-    [blit copyFromBuffer:k->buffer sourceOffset:0
+    [blit copyFromBuffer:k->buffer sourceOffset:k->offset
                 toBuffer:cache_k->buffer destinationOffset:offset
                     size:bytes];
-    [blit copyFromBuffer:v->buffer sourceOffset:0
+    [blit copyFromBuffer:v->buffer sourceOffset:v->offset
                 toBuffer:cache_v->buffer destinationOffset:offset
                     size:bytes];
     [blit endEncoding];
@@ -1337,4 +1344,73 @@ int q4_gpu_matmul_q5_k_tensor(
     }
     /* For n_tok > 1, we'd need a batched kernel. Fall back to CPU for now. */
     return -1;
+}
+
+/* =========================================================================
+ * Fused Q4_K matmul: 4 separate matmuls from same input vector in one dispatch.
+ *
+ * out[] is a concatenated output buffer containing 4 regions:
+ *   out[0..out0-1]         <- normed @ W0 (weight_offset[0], Q4_K)
+ *   out[out0..out0+out1-1] <- normed @ W1 (weight_offset[1], Q4_K)
+ *   out[out0+out1..]       <- normed @ W2 (weight_offset[2], Q4_K)
+ *   out[out0+out1+out2..]  <- normed @ W3 (weight_offset[3], Q4_K)
+ *
+ * weight_offsets and out_dims are arrays of 4 values.
+ * ========================================================================= */
+
+int q4_gpu_matmul_q4_k_fused4_tensor(
+        q4_gpu_tensor *out,
+        const void    *model_map,
+        uint64_t       model_size,
+        const uint64_t weight_offsets[4],
+        const uint32_t out_dims[4],
+        uint64_t       in_dim,
+        const q4_gpu_tensor *x) {
+    ensure_encoder("matmul_q4k_fused4");
+
+    id<MTLComputePipelineState> pso = make_pipeline("kernel_mul_mv_q4_k_fused4");
+    if (!pso) return -1;
+
+    [g_encoder setComputePipelineState:pso];
+
+    /* 4 weight buffers (all from model buffer at different offsets) */
+    for (int i = 0; i < 4; i++) {
+        [g_encoder setBuffer:g_model_buffer offset:weight_offsets[i] atIndex:i];
+    }
+    /* Input vector */
+    [g_encoder setBuffer:x->buffer offset:x->offset atIndex:4];
+    /* Output buffer */
+    [g_encoder setBuffer:out->buffer offset:out->offset atIndex:5];
+
+    /* Argument struct */
+    struct {
+        int32_t in_dim;
+        int32_t out0, out1, out2, out3;
+        uint64_t woff0, woff1, woff2, woff3;
+        uint64_t ooff0, ooff1, ooff2, ooff3;
+    } fused_args = {
+        .in_dim = (int32_t)in_dim,
+        .out0 = (int32_t)out_dims[0], .out1 = (int32_t)out_dims[1],
+        .out2 = (int32_t)out_dims[2], .out3 = (int32_t)out_dims[3],
+        .woff0 = weight_offsets[0], .woff1 = weight_offsets[1],
+        .woff2 = weight_offsets[2], .woff3 = weight_offsets[3],
+        .ooff0 = 0,
+        .ooff1 = out_dims[0],
+        .ooff2 = (uint64_t)out_dims[0] + out_dims[1],
+        .ooff3 = (uint64_t)out_dims[0] + out_dims[1] + out_dims[2],
+    };
+    [g_encoder setBytes:&fused_args length:sizeof(fused_args) atIndex:6];
+
+    /* Threadgroup layout: x = output rows / NR0, z = matmul_id (0-3) */
+    NSUInteger tg_x = (out_dims[0] + 1) / 2; /* ceil(out0 / 2) */
+    /* Use the max of all 4 output dims to set x dimension */
+    if ((out_dims[1] + 1) / 2 > tg_x) tg_x = (out_dims[1] + 1) / 2;
+    if ((out_dims[2] + 1) / 2 > tg_x) tg_x = (out_dims[2] + 1) / 2;
+    if ((out_dims[3] + 1) / 2 > tg_x) tg_x = (out_dims[3] + 1) / 2;
+
+    MTLSize grid = MTLSizeMake(tg_x, 1, 4);  /* 4 matmuls in z dimension */
+    MTLSize group = MTLSizeMake(32, 1, 1);   /* 32 threads per group */
+    [g_encoder dispatchThreads:grid threadsPerThreadgroup:group];
+
+    return 0;
 }

@@ -96,6 +96,16 @@ int q4_gpu_matmul_q4_k_tensor(
         const q4_gpu_tensor *x,
         uint32_t       n_tok);
 
+/* Fused: 4 Q4_K matmuls from same input in one dispatch. */
+int q4_gpu_matmul_q4_k_fused4_tensor(
+        q4_gpu_tensor *out,
+        const void    *model_map,
+        uint64_t       model_size,
+        const uint64_t weight_offsets[4],
+        const uint32_t out_dims[4],
+        uint64_t       in_dim,
+        const q4_gpu_tensor *x);
+
 /* Q6_K matrix-vector multiply. Same signature as q8_0 variant. */
 int q4_gpu_matmul_q6_k_tensor(
         q4_gpu_tensor *out,

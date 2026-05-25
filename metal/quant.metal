@@ -289,3 +289,136 @@ kernel void kernel_mul_mv_q6_k_f32(
         if (tiisg == 0 && sgitg == 0) dst_f32[r0 + row] = tot;
     }
 }
+
+/* =========================================================================
+ * Fused Q4_K matrix-vector multiply: 4 separate matmuls from same input.
+ *
+ * Computes in a single dispatch:
+ *   dst0[out0] = x[in_dim] @ W0[in_dim, out0]  (Q4_K)
+ *   dst1[out1] = x[in_dim] @ W1[in_dim, out1]  (Q4_K)
+ *   dst2[out2] = x[in_dim] @ W2[in_dim, out2]  (Q4_K)
+ *   dst3[out3] = x[in_dim] @ W3[in_dim, out3]  (Q4_K)
+ *
+ * All weights share the same input vector x. This replaces 4 separate
+ * kernel dispatches for DeltaNet (qkv_raw, alpha_raw, beta_raw, z_raw).
+ * ========================================================================= */
+
+struct q4_fused4_args {
+    int in_dim;
+    int out0, out1, out2, out3;
+    ulong woff0, woff1, woff2, woff3;
+    ulong ooff0, ooff1, ooff2, ooff3;
+};
+
+[[host_name("kernel_mul_mv_q4_k_fused4")]]
+kernel void kernel_mul_mv_q4_k_fused4(
+        device const char *w0             [[buffer(0)]],
+        device const char *w1             [[buffer(1)]],
+        device const char *w2             [[buffer(2)]],
+        device const char *w3             [[buffer(3)]],
+        device const float *src1          [[buffer(4)]],
+        device       float *dst           [[buffer(5)]],
+        constant q4_fused4_args &args     [[buffer(6)]],
+        threadgroup  char *shmem          [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    constexpr short NR0 = 2;
+    constexpr short NW = 32;
+
+    /* Threadgroup z selects which of the 4 matmuls this group computes. */
+    const int matmul_id = (int)tgpig.z;
+
+    const int out_dim = (matmul_id == 0) ? args.out0 :
+                        (matmul_id == 1) ? args.out1 :
+                        (matmul_id == 2) ? args.out2 : args.out3;
+    const ulong woff = (matmul_id == 0) ? args.woff0 :
+                       (matmul_id == 1) ? args.woff1 :
+                       (matmul_id == 2) ? args.woff2 : args.woff3;
+    const ulong ooff = (matmul_id == 0) ? args.ooff0 :
+                       (matmul_id == 1) ? args.ooff1 :
+                       (matmul_id == 2) ? args.ooff2 : args.ooff3;
+
+    /* Early exit if this matmul has no output rows */
+    if (out_dim <= 0) return;
+
+    const int nb = args.in_dim / QK_K;
+    const int r0 = (int)tgpig.x * NR0;
+
+    /* Skip if this threadgroup's rows are beyond the output dimension */
+    if (r0 >= out_dim) return;
+
+    device const block_q4_K *w_base = (device const block_q4_K *)(w0 + woff);
+    if (matmul_id == 1) w_base = (device const block_q4_K *)(w1 + woff);
+    else if (matmul_id == 2) w_base = (device const block_q4_K *)(w2 + woff);
+    else if (matmul_id == 3) w_base = (device const block_q4_K *)(w3 + woff);
+
+    device const float *y = src1;
+    float sumf[NR0] = {0.f};
+    const short e0 = tiisg * 8;
+
+    for (int ib = 0; ib < nb; ib++) {
+        for (short row = 0; row < NR0; ++row) {
+            const uint row_stride = (uint)(args.in_dim / QK_K);
+            device const block_q4_K *xb = &w_base[(r0 + row) * row_stride + ib];
+
+            device const uint16_t *raw16 = (device const uint16_t *)xb;
+            const float d = q4k_f16_to_f32(raw16[0]);
+            const float dm = q4k_f16_to_f32(raw16[1]);
+
+            float acc = 0.f;
+            for (short i = 0; i < 8; ++i) {
+                const short e = e0 + i;
+                const short grp = e / 32;
+                const short pos = e % 32;
+                const short sub = pos / 16;
+                const short idx = pos % 16;
+
+                const bool is_high_grp = grp >= 6;
+                const float dmul = is_high_grp ? (d / 16.0f) : d;
+
+                float sc_val, mn_val;
+                if (grp < 6) {
+                    sc_val = (float)(xb->scales[grp] & 0x3F);
+                    mn_val = (float)(xb->scales[6 + grp] & 0x3F);
+                } else {
+                    const short gi = grp - 6;
+                    sc_val = (float)((xb->scales[4 + gi] >> 4) | ((xb->scales[gi] & 0xC0) >> 2));
+                    mn_val = (float)((xb->scales[10 + gi] >> 4) | ((xb->scales[6 + gi] & 0xC0) >> 2));
+                }
+
+                const short qs_off = (grp / 2) * 32 + sub * 16;
+                const uchar qbyte = xb->qs[qs_off + idx];
+                const uchar mask = sub == 0 ? 0x0F : 0xF0;
+                const float q = (float)((qbyte & mask) >> (sub * 4));
+
+                acc += y[e] * (dmul * sc_val * q - dm * mn_val);
+            }
+            sumf[row] += acc;
+        }
+        y += QK_K;
+    }
+
+    /* SIMD reduce and write */
+    threadgroup float *shmem_f32[NR0];
+    for (short row = 0; row < NR0; ++row) {
+        shmem_f32[row] = (threadgroup float *)shmem + 32 * row;
+        if (sgitg == 0) shmem_f32[row][tiisg] = 0.0f;
+        sumf[row] = simd_sum(sumf[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0; ++row) {
+        if (tiisg == 0) shmem_f32[row][sgitg] = sumf[row];
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0 && r0 + row < out_dim; ++row) {
+        if (tiisg == 0 && sgitg == 0) {
+            dst[ooff + (uint64_t)r0 + row] = shmem_f32[row][0];
+        }
+    }
+}
