@@ -3018,18 +3018,14 @@ static int q4_gpu_forward(q4_engine *e, q4_session *s, int token, uint32_t pos, 
                 return -1;
             }
 
-            /* Residual: hidden = attn_out + residual (input to layer) */
-            if (q4_gpu_tensor_copy(s->gpu_hidden, 0, attn_out, 0, embd_bytes) != 0) {
-                if (err && errlen > 0) snprintf(err, errlen, "layer %u attn output copy failed", il);
+            /* Residual: hidden = attn_out + residual.
+             * Optimize: residual += attn_out (in-place), then copy to hidden.
+             * Saves 1 dispatch vs copy(attn_out→hidden) + add + copy(hidden→residual). */
+            if (q4_gpu_residual_add_tensor(s->gpu_residual, attn_out, n_embd) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u attn residual add failed", il);
                 return -1;
             }
-            if (q4_gpu_residual_add_tensor(s->gpu_hidden, s->gpu_residual, n_embd) != 0) {
-                if (err && errlen > 0) snprintf(err, errlen, "layer %u residual add failed", il);
-                return -1;
-            }
-
-            /* Update residual for FFN residual */
-            if (q4_gpu_tensor_copy(s->gpu_residual, 0, s->gpu_hidden, 0, embd_bytes) != 0) {
+            if (q4_gpu_tensor_copy(s->gpu_hidden, 0, s->gpu_residual, 0, embd_bytes) != 0) {
                 if (err && errlen > 0) snprintf(err, errlen, "layer %u attn residual copy failed", il);
                 return -1;
             }
@@ -3048,19 +3044,13 @@ static int q4_gpu_forward(q4_engine *e, q4_session *s, int token, uint32_t pos, 
             }
 
             /* Residual add: hidden = normed + residual */
-            /* First copy residual (pre-layer hidden) to gpu_hidden */
-            if (q4_gpu_tensor_copy(s->gpu_hidden, 0, s->gpu_residual, 0, embd_bytes) != 0) {
-                if (err && errlen > 0) snprintf(err, errlen, "layer %u residual copy failed", il);
-                return -1;
-            }
-            /* Then add normed (post-norm output) to hidden */
-            if (q4_gpu_residual_add_tensor(s->gpu_hidden, s->gpu_normed, n_embd) != 0) {
+            /* Optimize: residual += normed (in-place), then copy to hidden.
+             * Saves 1 dispatch vs copy + add + copy. */
+            if (q4_gpu_residual_add_tensor(s->gpu_residual, s->gpu_normed, n_embd) != 0) {
                 if (err && errlen > 0) snprintf(err, errlen, "layer %u residual add failed", il);
                 return -1;
             }
-
-            /* Update residual = hidden for next residual connection */
-            if (q4_gpu_tensor_copy(s->gpu_residual, 0, s->gpu_hidden, 0, embd_bytes) != 0) {
+            if (q4_gpu_tensor_copy(s->gpu_hidden, 0, s->gpu_residual, 0, embd_bytes) != 0) {
                 if (err && errlen > 0) snprintf(err, errlen, "layer %u residual copy failed", il);
                 return -1;
             }
