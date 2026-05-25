@@ -2927,23 +2927,52 @@ static int q4_gpu_forward(q4_engine *e, q4_session *s, int token, uint32_t pos, 
             /* SSM state stays on GPU between tokens — only read back at session save time. */
         } else {
             /* --- Gated Attention --- */
-            /* Allocate scratch for Q, K, V */
-            uint64_t q_off = gpu_scratch_alloc(s, q_bytes);
-            uint64_t k_off = gpu_scratch_alloc(s, kv_bytes);
-            uint64_t v_off = gpu_scratch_alloc(s, kv_bytes);
-            q4_gpu_tensor *q_t = gpu_scratch_view(s, q_off, q_bytes);
-            q4_gpu_tensor *k_t = gpu_scratch_view(s, k_off, kv_bytes);
-            q4_gpu_tensor *v_t = gpu_scratch_view(s, v_off, kv_bytes);
 
-            /* Project Q, K, V from normed input */
-            if (q4_gpu_matmul_any_tensor(q_t, model_map, model_size, l->attn_q->abs_offset,
-                    n_embd, Q4_N_HEAD * Q4_Q_HEAD_DIM, l->attn_q->type, s->gpu_normed, 1) != 0 ||
-                q4_gpu_matmul_any_tensor(k_t, model_map, model_size, l->attn_k->abs_offset,
-                    n_embd, Q4_N_HEAD_KV * Q4_HEAD_DIM, l->attn_k->type, s->gpu_normed, 1) != 0 ||
-                q4_gpu_matmul_any_tensor(v_t, model_map, model_size, l->attn_v->abs_offset,
-                    n_embd, Q4_N_HEAD_KV * Q4_HEAD_DIM, l->attn_v->type, s->gpu_normed, 1) != 0) {
-                if (err && errlen > 0) snprintf(err, errlen, "layer %u QKV projection failed", il);
-                return -1;
+            /* Q, K, V projections from normed input.
+             * Fuse into single dispatch when all weights are Q4_K. */
+            q4_gpu_tensor *q_t, *k_t, *v_t;
+
+            if (l->attn_q->type == Q4_TENSOR_Q4_K &&
+                l->attn_k->type == Q4_TENSOR_Q4_K &&
+                l->attn_v->type == Q4_TENSOR_Q4_K) {
+                /* Fused QKV: 3 matmuls from same input in one dispatch. */
+                const uint32_t q_out_dim = Q4_N_HEAD * Q4_Q_HEAD_DIM;    /* 12288 */
+                const uint32_t kv_out_dim = Q4_N_HEAD_KV * Q4_HEAD_DIM;  /* 1024 */
+                const uint64_t fused_qkv_bytes = (q_out_dim + kv_out_dim + kv_out_dim) * sizeof(float);
+                uint64_t fused_qkv_off = gpu_scratch_alloc(s, fused_qkv_bytes);
+                q4_gpu_tensor *fused_qkv_t = gpu_scratch_view(s, fused_qkv_off, fused_qkv_bytes);
+
+                const uint64_t qkv_weights[4] = {
+                    l->attn_q->abs_offset, l->attn_k->abs_offset, l->attn_v->abs_offset, 0,
+                };
+                const uint32_t qkv_dims[4] = { q_out_dim, kv_out_dim, kv_out_dim, 0 };
+                if (q4_gpu_matmul_q4_k_fused4_tensor(fused_qkv_t, model_map, model_size,
+                        qkv_weights, qkv_dims, n_embd, s->gpu_normed) != 0) {
+                    if (err && errlen > 0) snprintf(err, errlen, "layer %u fused QKV projection failed", il);
+                    return -1;
+                }
+
+                q_t = q4_gpu_tensor_view(fused_qkv_t, 0, q_bytes);
+                k_t = q4_gpu_tensor_view(fused_qkv_t, (uint64_t)q_out_dim * sizeof(float), kv_bytes);
+                v_t = q4_gpu_tensor_view(fused_qkv_t, (uint64_t)(q_out_dim + kv_out_dim) * sizeof(float), kv_bytes);
+            } else {
+                /* Fallback: separate matmuls. */
+                uint64_t q_off = gpu_scratch_alloc(s, q_bytes);
+                uint64_t k_off = gpu_scratch_alloc(s, kv_bytes);
+                uint64_t v_off = gpu_scratch_alloc(s, kv_bytes);
+                q_t = gpu_scratch_view(s, q_off, q_bytes);
+                k_t = gpu_scratch_view(s, k_off, kv_bytes);
+                v_t = gpu_scratch_view(s, v_off, kv_bytes);
+
+                if (q4_gpu_matmul_any_tensor(q_t, model_map, model_size, l->attn_q->abs_offset,
+                        n_embd, Q4_N_HEAD * Q4_Q_HEAD_DIM, l->attn_q->type, s->gpu_normed, 1) != 0 ||
+                    q4_gpu_matmul_any_tensor(k_t, model_map, model_size, l->attn_k->abs_offset,
+                        n_embd, Q4_N_HEAD_KV * Q4_HEAD_DIM, l->attn_k->type, s->gpu_normed, 1) != 0 ||
+                    q4_gpu_matmul_any_tensor(v_t, model_map, model_size, l->attn_v->abs_offset,
+                        n_embd, Q4_N_HEAD_KV * Q4_HEAD_DIM, l->attn_v->type, s->gpu_normed, 1) != 0) {
+                    if (err && errlen > 0) snprintf(err, errlen, "layer %u QKV projection failed", il);
+                    return -1;
+                }
             }
 
             /* Apply RoPE to Q and K */

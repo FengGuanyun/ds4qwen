@@ -22,3 +22,16 @@ kernel void kernel_elementwise_mul(
     if (tid >= n) return;
     out[tid] = a[tid] * b[tid];
 }
+
+// In-encoder GPU copy: dst[dst_off..] = src[src_off..]
+[[host_name("kernel_tensor_copy")]]
+kernel void kernel_tensor_copy(
+        device const char *src,
+        device char *dst,
+        constant uint64_t &src_offset,
+        constant uint64_t &dst_offset,
+        constant uint64_t &bytes,
+        uint tid[[thread_position_in_grid]]) {
+    if (tid >= bytes) return;
+    dst[dst_offset + tid] = src[src_offset + tid];
+}

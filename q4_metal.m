@@ -158,6 +158,13 @@ void q4_gpu_cleanup(void) {
 static id<MTLCommandBuffer> g_cmd_buffer;
 static id<MTLComputeCommandEncoder> g_encoder;
 
+static inline NSUInteger round_up_simd(NSUInteger n) {
+    return (n + 31) / 32 * 32;
+}
+
+static id<MTLComputePipelineState> make_pipeline(const char *name);
+static void ensure_encoder(const char *name);
+
 /* =========================================================================
  * Tensor Lifecycle.
  * ========================================================================= */
@@ -230,7 +237,30 @@ int q4_gpu_tensor_copy(q4_gpu_tensor *dst, uint64_t dst_offset,
                           uint64_t bytes) {
     if (!dst || !src || dst_offset + bytes > dst->bytes ||
         src_offset + bytes > src->bytes) return -1;
+    if (bytes == 0) return 0;
 
+    /* If we have an active compute encoder, dispatch copy kernel in-place.
+     * This avoids creating a separate blit command buffer and sync. */
+    if (g_encoder) {
+        id<MTLComputePipelineState> pso = make_pipeline("kernel_tensor_copy");
+        if (!pso) return -1;
+
+        [g_encoder setComputePipelineState:pso];
+
+        [g_encoder setBuffer:src->buffer offset:src->offset + src_offset atIndex:0];
+        [g_encoder setBuffer:dst->buffer offset:dst->offset + dst_offset atIndex:1];
+        [g_encoder setBytes:&src_offset length:sizeof(src_offset) atIndex:2];
+        [g_encoder setBytes:&dst_offset length:sizeof(dst_offset) atIndex:3];
+        [g_encoder setBytes:&bytes length:sizeof(bytes) atIndex:4];
+
+        NSUInteger nthreads = round_up_simd(bytes);
+        MTLSize grid = MTLSizeMake(nthreads, 1, 1);
+        MTLSize group = MTLSizeMake(32, 1, 1);
+        [g_encoder dispatchThreads:grid threadsPerThreadgroup:group];
+        return 0;
+    }
+
+    /* No active encoder: fall back to standalone blit command buffer. */
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
     [blit copyFromBuffer:src->buffer
@@ -366,11 +396,6 @@ static void ensure_encoder(const char *name) {
         }
         g_encoder = [g_cmd_buffer computeCommandEncoder];
     }
-}
-
-/* Round up to SIMD width */
-static inline NSUInteger round_up_simd(NSUInteger n) {
-    return (n + 31) / 32 * 32;
 }
 
 /* =========================================================================
