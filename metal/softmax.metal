@@ -8,8 +8,8 @@ struct q4_metal_args_softmax {
 };
 
 // Row softmax: out[row] = softmax(in[row] * scale)
-template<typename T>
-kernel void kernel_soft_max(
+[[host_name("kernel_soft_max_f32")]]
+kernel void kernel_soft_max_f32(
         constant q4_metal_args_softmax & args,
         device const  char * src0,
         device        char * dst,
@@ -26,7 +26,7 @@ kernel void kernel_soft_max(
     // Find max
     float lmax = -INFINITY;
     for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
-        lmax = max(lmax, psrc[i] * args.scale);
+        lmax = metal::max(lmax, psrc[i] * args.scale);
     }
 
     float max_val = simd_max(lmax);
@@ -42,7 +42,7 @@ kernel void kernel_soft_max(
     // Compute exp and sum
     float lsum = 0.0f;
     for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
-        const float e = exp(psrc[i] * args.scale - max_val);
+        const float e = metal::exp(psrc[i] * args.scale - max_val);
         pdst[i] = e;
         lsum += e;
     }
@@ -62,7 +62,3 @@ kernel void kernel_soft_max(
         pdst[i] *= inv_sum;
     }
 }
-
-typedef decltype(kernel_soft_max<float>) kernel_soft_max_t;
-
-[[host_name("kernel_soft_max_f32")]]   kernel kernel_soft_max_t kernel_soft_max<float>;

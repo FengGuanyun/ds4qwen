@@ -1,32 +1,10 @@
 // Q4 Metal matmul kernels - adapted from ds4 dense.metal.
 // Supports Q8_0 and F16 weights with F32 activations for Qwen3.6-27B.
 
-#include "common.metal"
+// common.metal inlined above
 
 constant short FC_mul_mv_nsg   [[function_constant(0)]];
 constant short FC_mul_mv_nxpsg [[function_constant(1)]];
-
-struct q4_metal_args_mul_mv {
-    int ne00;
-    int ne01;
-    int ne02;
-    ulong nb00;
-    ulong nb01;
-    ulong nb02;
-    ulong nb03;
-    int ne10;
-    int ne11;
-    int ne12;
-    ulong nb10;
-    ulong nb11;
-    ulong nb12;
-    ulong nb13;
-    int ne0;
-    int ne1;
-    int nr0;
-    short r2;
-    short r3;
-};
 
 // Q8_0 matrix-vector multiply for decode.
 // out[out_row] = x[in_dim] @ W[in_dim, out_row] where W is Q8_0.
@@ -72,7 +50,7 @@ kernel void kernel_mul_mv_q8_0_f32(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    const short NSG = FC_mul_mv_nsg;
+    const short NSG = 1;  /* Fixed for decode; FC_mul_mv_nsg default is 0 */
     constexpr short NW = N_SIMDWIDTH;
     constexpr short NQ = 8;
     constexpr short NR0 = 2;
@@ -128,7 +106,7 @@ kernel void kernel_mul_mv_f16_f32(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    const short NSG = FC_mul_mv_nsg;
+    const short NSG = 1;  /* Fixed for decode; FC_mul_mv_nsg default is 0 */
     constexpr short NW = N_SIMDWIDTH;
     constexpr short NB = 32;
     constexpr short NF = 8;
@@ -194,7 +172,7 @@ kernel void kernel_shared_gate_up_swiglu_q8_0(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    const short NSG = FC_mul_mv_nsg;
+    const short NSG = 1;  /* Fixed for decode; FC_mul_mv_nsg default is 0 */
     constexpr short NW = N_SIMDWIDTH;
     constexpr short NQ = 8;
     constexpr short NR0 = 2;
@@ -316,8 +294,8 @@ kernel void kernel_mul_mm_f16_f32(
     for (short i = 0; i < 8; i++) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
-        simdgroup_half4x4 temp_a;
-        for (short i = 0; i < 16; i++) temp_a[i/4][i%4] = x[i];
+        half temp_a[16];
+        for (short i = 0; i < 16; i++) temp_a[i] = x[i];
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (short i = 0; i < 16; i++) {
@@ -325,7 +303,7 @@ kernel void kernel_mul_mm_f16_f32(
             const short sy = (tiitg / NL0) / 8;
             const short lx = (tiitg / NL0) % 8;
             const short ly = i % 8;
-            *(sa + 64 * (8 * sx + sy) + 8 * ly + lx) = loop_k + 16 * il0 + i < args.ne00 ? temp_a[i/4][i%4] : 0;
+            *(sa + 64 * (8 * sx + sy) + 8 * ly + lx) = loop_k + 16 * il0 + i < args.ne00 ? temp_a[i] : 0;
         }
 
         for (short i = 0; i < 8; ++i) {

@@ -22,6 +22,7 @@ q4_gpu_tensor *q4_gpu_tensor_alloc(uint64_t bytes);
 q4_gpu_tensor *q4_gpu_tensor_view(const q4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 void q4_gpu_tensor_free(q4_gpu_tensor *tensor);
 uint64_t q4_gpu_tensor_bytes(const q4_gpu_tensor *tensor);
+uint64_t q4_gpu_tensor_offset(const q4_gpu_tensor *tensor);
 void *q4_gpu_tensor_contents(q4_gpu_tensor *tensor);
 int q4_gpu_tensor_fill_f32(q4_gpu_tensor *tensor, float value, uint64_t count);
 int q4_gpu_tensor_write(q4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
@@ -82,6 +83,39 @@ int q4_gpu_matmul_q8_0_tensor(
         uint64_t       weight_offset,
         uint64_t       in_dim,
         uint64_t       out_dim,
+        const q4_gpu_tensor *x,
+        uint32_t       n_tok);
+
+int q4_gpu_matmul_q4_k_tensor(
+        q4_gpu_tensor *out,
+        const void    *model_map,
+        uint64_t       model_size,
+        uint64_t       weight_offset,
+        uint64_t       in_dim,
+        uint64_t       out_dim,
+        const q4_gpu_tensor *x,
+        uint32_t       n_tok);
+
+/* Q6_K matrix-vector multiply. Same signature as q8_0 variant. */
+int q4_gpu_matmul_q6_k_tensor(
+        q4_gpu_tensor *out,
+        const void    *model_map,
+        uint64_t       model_size,
+        uint64_t       weight_offset,
+        uint64_t       in_dim,
+        uint64_t       out_dim,
+        const q4_gpu_tensor *x,
+        uint32_t       n_tok);
+
+/* Dispatch to the correct quantization kernel based on tensor type. */
+int q4_gpu_matmul_any_tensor(
+        q4_gpu_tensor *out,
+        const void    *model_map,
+        uint64_t       model_size,
+        uint64_t       weight_offset,
+        uint64_t       in_dim,
+        uint64_t       out_dim,
+        uint32_t       weight_type,
         const q4_gpu_tensor *x,
         uint32_t       n_tok);
 
@@ -192,6 +226,14 @@ int q4_gpu_silu_tensor(
         const q4_gpu_tensor *x,
         uint64_t       n);
 
+/* Fused: out = SiLU(clamp(gate)) * up, all on GPU */
+int q4_gpu_silu_clamped_mul_tensor(
+        q4_gpu_tensor *out,
+        const q4_gpu_tensor *gate,
+        const q4_gpu_tensor *up,
+        uint64_t       n,
+        float          clamp);
+
 /* Elementwise: out = a * b (broadcast b across rows) */
 int q4_gpu_mul_rows_tensor(
         q4_gpu_tensor *out,
@@ -205,6 +247,83 @@ int q4_gpu_residual_add_tensor(
         q4_gpu_tensor *x,
         const q4_gpu_tensor *residual,
         uint64_t       n);
+
+/* =========================================================================
+ * DeltaNet GPU Operations.
+ * ========================================================================= */
+
+/* Vector-matrix Q4_K multiply: out[out_dim] = vec[in_dim] @ W[out_dim, in_dim] */
+int q4_gpu_vec_matmul_q4k_tensor(
+        q4_gpu_tensor *out,
+        const void    *model_map,
+        uint64_t       model_size,
+        uint64_t       weight_offset,
+        uint64_t       in_dim,
+        uint64_t       out_dim,
+        const q4_gpu_tensor *x);
+
+/* Fused conv1D + split + L2 norm + expand for DeltaNet. */
+int q4_gpu_deltanet_conv_split_tensor(
+        const q4_gpu_tensor *qkv_raw,
+        const q4_gpu_tensor *conv_buf,
+        const q4_gpu_tensor *conv_buf_out,
+        const void          *model_map,
+        uint64_t             model_size,
+        uint64_t             conv_w_offset,
+        q4_gpu_tensor       *q_exp,
+        q4_gpu_tensor       *k_exp,
+        q4_gpu_tensor       *v_out,
+        uint32_t             qkv_dim,
+        uint32_t             n_k_groups,
+        uint32_t             n_v_heads,
+        uint32_t             head_k_dim,
+        uint32_t             head_v_dim,
+        uint32_t             repeat,
+        uint32_t             conv_pos);
+
+/* Gate transforms: gate = softplus(alpha + bias) * a, beta = sigmoid(beta) */
+int q4_gpu_deltanet_gate_transform_tensor(
+        const q4_gpu_tensor *alpha_raw,
+        const q4_gpu_tensor *beta_raw,
+        q4_gpu_tensor       *gate_out,
+        q4_gpu_tensor       *beta_out,
+        const void          *model_map,
+        uint64_t             model_size,
+        uint64_t             dt_bias_offset,
+        uint64_t             ssm_a_offset,
+        uint32_t             n);
+
+/* Delta rule per v_head: sk = state @ k; delta = v - sk; state update; out = state @ k */
+int q4_gpu_delta_rule_tensor(
+        q4_gpu_tensor *state,
+        const q4_gpu_tensor *k_exp,
+        const q4_gpu_tensor *v_raw,
+        const q4_gpu_tensor *gate,
+        const q4_gpu_tensor *beta,
+        q4_gpu_tensor *output,
+        uint32_t n_v_heads,
+        uint32_t head_v_dim,
+        uint32_t head_k_dim);
+
+/* SiLU gate + RMS norm per v_head */
+int q4_gpu_deltanet_silu_rms_tensor(
+        q4_gpu_tensor *inout,
+        const q4_gpu_tensor *z_raw,
+        const void    *model_map,
+        uint64_t       model_size,
+        uint64_t       ssm_norm_w_offset,
+        uint32_t       n_v_heads,
+        uint32_t       head_v_dim);
+
+/* Vector-matrix Q5_K multiply: out[out_dim] = vec[in_dim] @ W[out_dim, in_dim] */
+int q4_gpu_vec_matmul_q5k_tensor(
+        q4_gpu_tensor *out,
+        const void    *model_map,
+        uint64_t       model_size,
+        uint64_t       weight_offset,
+        uint64_t       in_dim,
+        uint64_t       out_dim,
+        const q4_gpu_tensor *x);
 
 /* Softmax over last dimension for each row. */
 int q4_gpu_softmax_tensor(

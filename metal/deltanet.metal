@@ -36,16 +36,11 @@ kernel void kernel_deltanet_step(
     if (kv_head >= args.n_kv_heads) return;
 
     const uint base = kv_head * args.head_dim;
-    const float scale_factor = 1.0f / args.n_embd;
-
-    // Compute x projected to head_dim (simplified: assume x is already projected)
-    // In practice, W_a @ h_norm, W_b @ h_norm, W_dt @ h_norm are computed before this kernel
 
     // Update state: s' = (1 - dt) * s + dt * (b * v)
     // Here x serves as the combined input (already through projections)
     for (uint d = tpitg.x; d < args.head_dim; d += tptg.x) {
         const uint idx = base + d;
-        const float a = a_gate[idx];
         const float b = b_proj[idx];
         const float dt = dt_gate[idx];
         const float v = x[idx];  // simplified: v comes from the same projection
@@ -97,7 +92,6 @@ kernel void kernel_deltanet_prefill(
             const uint idx = base + d;
             const uint kv_idx = tok_offset_kv + idx;
 
-            const float a = a_gate[kv_idx];
             const float b = b_proj[kv_idx];
             const float dt_val = dt_gate[kv_idx];
             const float v = v_in[kv_idx];

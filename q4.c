@@ -63,11 +63,20 @@ enum {
     Q4_N_VOCAB      = 248320,
     Q4_N_HEAD       = 24,
     Q4_N_HEAD_KV    = 4,
-    Q4_HEAD_DIM     = 128,
-    Q4_N_FFN        = 18944,
-    Q4_Q_PER_KV     = 6,  // 24 / 4
-    Q4_BLOCK_SIZE   = 4,  // 3 DeltaNet + 1 Attention
+    Q4_HEAD_DIM     = 256,    /* K/V head dimension */
+    Q4_Q_HEAD_DIM   = 512,    /* Q head dimension (24 * 512 = 12288) */
+    Q4_N_FFN        = 17408,
+    Q4_Q_PER_KV     = 6,  /* 24 / 4 */
+    Q4_BLOCK_SIZE   = 4,  /* 3 DeltaNet + 1 Attention */
     Q4_N_BLOCKS     = 16,
+
+    /* Gated DeltaNet dimensions */
+    Q4_N_V_HEADS    = 48,   /* ssm_time_step_rank = num value heads */
+    Q4_N_K_GROUPS   = 16,   /* ssm_group_count = num key heads */
+    Q4_HEAD_K_DIM   = 128,  /* ssm_state_size = key dim per group */
+    Q4_HEAD_V_DIM   = 128,  /* head_v_dim = ssm_inner_size / n_v_heads */
+    Q4_QKV_DIM      = 10240,/* n_embd + n_k_dim + n_v_dim = 5120+2048+6144 (no: qkv_dim) */
+    Q4_CONV_KERNEL  = 4,    /* ssm_conv_kernel */
 };
 
 /* Model config read from GGUF metadata. */
@@ -92,8 +101,36 @@ typedef struct {
     int8_t   qs[QK8_0];
 } block_q8_0;
 
+#define QK_K 256
+
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t  scales[12];
+    uint8_t  qs[QK_K / 2];
+} block_q4_K;
+
+typedef struct {
+    uint8_t ql[QK_K / 2];
+    uint8_t qh[QK_K / 4];
+    int8_t  scales[QK_K / 16];
+    uint16_t d;
+} block_q6_K;
+
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t  scales[12];
+    uint8_t  qh[QK_K / 8];   /* 32 bytes: 1 high bit per element (bit 4), 256/8=32 */
+    uint8_t  qs[QK_K / 2];   /* 128 bytes: low 4 bits per element */
+} block_q5_K;
+/* Total: 2+2+12+32+128 = 176 bytes */
+
 #define Q4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 Q4_STATIC_ASSERT(q4_block_q8_0_size, sizeof(block_q8_0) == 34);
+Q4_STATIC_ASSERT(q4_block_q4_k_size, sizeof(block_q4_K) == 144);
+Q4_STATIC_ASSERT(q4_block_q5_k_size, sizeof(block_q5_K) == 176);
+Q4_STATIC_ASSERT(q4_block_q6_k_size, sizeof(block_q6_K) == 210);
 
 /* =========================================================================
  * Thread Pool for CPU decode reference.
@@ -475,6 +512,9 @@ enum {
     Q4_TENSOR_F32   = 0,
     Q4_TENSOR_F16   = 1,
     Q4_TENSOR_Q8_0  = 8,
+    Q4_TENSOR_Q4_K  = 12,
+    Q4_TENSOR_Q5_K  = 13,
+    Q4_TENSOR_Q6_K  = 14,
     Q4_TENSOR_I32   = 26,
 };
 
@@ -805,24 +845,30 @@ static void print_size(uint64_t bytes) {
 
 typedef struct {
     // Shared across layer types
-    q4_tensor *attn_norm;
-    q4_tensor *ffn_norm;
+    q4_tensor *attn_norm;        /* pre-layer norm */
+    q4_tensor *post_attn_norm;   /* post-layer norm, also FFN pre-norm */
     q4_tensor *ffn_gate;
     q4_tensor *ffn_up;
     q4_tensor *ffn_down;
 
-    // DeltaNet-specific (il % 4 != 3)
-    q4_tensor *attn_a_gate;     // decay gate projection
-    q4_tensor *attn_b_proj;     // input projection
-    q4_tensor *attn_dt_gate;    // timestep gate
-    q4_tensor *attn_a_norm;     // post-delta norm
+    // DeltaNet (il % 4 != 3)
+    q4_tensor *attn_qkv;      /* [n_embd, qkv_dim=10240] Q6_K: q+k+v combined */
+    q4_tensor *ssm_conv1d;    /* [conv_kernel=4, qkv_dim=10240] F32 */
+    q4_tensor *ssm_alpha;     /* [n_embd, n_v_heads=48] F32 */
+    q4_tensor *ssm_beta;      /* [n_embd, n_v_heads=48] F32 */
+    q4_tensor *ssm_dt_bias;   /* [n_v_heads=48] F32 */
+    q4_tensor *ssm_a;         /* [n_v_heads=48] F32, gating factor */
+    q4_tensor *ssm_norm;      /* [head_v_dim=128] F32 */
+    q4_tensor *ssm_out;       /* [n_v_heads*head_v_dim=6144, n_embd] Q5_K */
+    q4_tensor *attn_gate;     /* [n_embd, n_v_heads*head_v_dim=6144] Q4_K, z gate */
 
-    // Gated Attention-specific (il % 4 == 3)
-    q4_tensor *attn_q;          // query projection
-    q4_tensor *attn_k;          // key projection
-    q4_tensor *attn_v;          // value projection
-    q4_tensor *attn_output;     // output projection
-    q4_tensor *attn_qk_norm;    // QK norm weights (if present)
+    // Gated Attention (il % 4 == 3)
+    q4_tensor *attn_q;        /* [n_embd, n_head*q_head_dim=12288] Q4_K */
+    q4_tensor *attn_k;        /* [n_embd, n_head_kv*head_dim=1024] Q4_K */
+    q4_tensor *attn_v;        /* [n_embd, n_head_kv*head_dim=1024] Q6_K */
+    q4_tensor *attn_output;   /* [n_head*q_head_dim=6144, n_embd] Q4_K */
+    q4_tensor *attn_q_norm;   /* [256] F32 - QK norm over first 256 dims */
+    q4_tensor *attn_k_norm;   /* [256] F32 */
 } q4_layer_weights;
 
 typedef struct {
@@ -967,6 +1013,33 @@ static void tensor_expect_q8_0_layout(
     tensor_expect_layout(t, Q4_TENSOR_Q8_0, ndim, d0, d1, d2);
 }
 
+static void tensor_expect_q4_k_layout(
+        const q4_tensor *t,
+        uint32_t         ndim,
+        uint64_t         d0,
+        uint64_t         d1,
+        uint64_t         d2) {
+    tensor_expect_layout(t, Q4_TENSOR_Q4_K, ndim, d0, d1, d2);
+}
+
+static void tensor_expect_q5_k_layout(
+        const q4_tensor *t,
+        uint32_t         ndim,
+        uint64_t         d0,
+        uint64_t         d1,
+        uint64_t         d2) {
+    tensor_expect_layout(t, Q4_TENSOR_Q5_K, ndim, d0, d1, d2);
+}
+
+static void tensor_expect_q6_k_layout(
+        const q4_tensor *t,
+        uint32_t         ndim,
+        uint64_t         d0,
+        uint64_t         d1,
+        uint64_t         d2) {
+    tensor_expect_layout(t, Q4_TENSOR_Q6_K, ndim, d0, d1, d2);
+}
+
 static void config_expect_u32(const char *name, uint32_t got, uint32_t expected) {
     if (got == expected) return;
     fprintf(stderr, "q4: expected %s=%u for Qwen3.6-27B, got %u\n", name, expected, got);
@@ -990,19 +1063,18 @@ static bool layer_is_attention(uint32_t il) {
 
 /* Validate metadata values that affect semantics. */
 static void config_validate_model(const q4_model *m) {
-    const uint32_t n_layer = required_u32(m, "qwen3.block_count");
-    const uint32_t n_embd = required_u32(m, "qwen3.embedding_length");
-    const uint32_t n_vocab = required_u32(m, "qwen3.vocab_size");
-    const uint32_t n_head = required_u32(m, "qwen3.attention.head_count");
-    const uint32_t n_head_kv = required_u32(m, "qwen3.attention.head_count_kv");
-    const uint32_t n_ffn = required_u32(m, "qwen3.feed_forward_length");
-    const uint32_t head_dim = required_u32(m, "qwen3.attention.key_length");
-    const float rms_eps = required_f32(m, "qwen3.attention.layer_norm_rms_epsilon");
-    const float rope_freq_base = required_f32(m, "qwen3.rope.freq_base");
+    const uint32_t n_layer = required_u32(m, "qwen35.block_count");
+    const uint32_t n_embd = required_u32(m, "qwen35.embedding_length");
+    const uint32_t n_head = required_u32(m, "qwen35.attention.head_count");
+    const uint32_t n_head_kv = required_u32(m, "qwen35.attention.head_count_kv");
+    const uint32_t n_ffn = required_u32(m, "qwen35.feed_forward_length");
+    const uint32_t head_dim = required_u32(m, "qwen35.attention.key_length");
+    const float rms_eps = required_f32(m, "qwen35.attention.layer_norm_rms_epsilon");
+    const float rope_freq_base = required_f32(m, "qwen35.rope.freq_base");
 
     config_expect_u32("block_count",         n_layer,  Q4_N_LAYER);
     config_expect_u32("embedding_length",     n_embd,   Q4_N_EMBD);
-    config_expect_u32("vocab_size",           n_vocab,  Q4_N_VOCAB);
+    // vocab_size not in metadata; inferred from token_embd tensor
     config_expect_u32("attention.head_count", n_head,   Q4_N_HEAD);
     config_expect_u32("attention.head_count_kv", n_head_kv, Q4_N_HEAD_KV);
     config_expect_u32("feed_forward_length",  n_ffn,    Q4_N_FFN);
@@ -1029,53 +1101,97 @@ static void weights_bind(q4_weights *w, const q4_model *m) {
 
         // Shared
         l->attn_norm = required_tensorf(m, "blk.%u.attn_norm.weight", il);
-        l->ffn_norm = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
+        l->post_attn_norm = required_tensorf(m, "blk.%u.post_attention_norm.weight", il);
         l->ffn_gate = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
         l->ffn_up = required_tensorf(m, "blk.%u.ffn_up.weight", il);
         l->ffn_down = required_tensorf(m, "blk.%u.ffn_down.weight", il);
 
         if (layer_is_deltanet(il)) {
             // DeltaNet layer
-            l->attn_a_gate = required_tensorf(m, "blk.%u.attn_a_gate.weight", il);
-            l->attn_b_proj = required_tensorf(m, "blk.%u.attn_b.weight", il);
-            l->attn_dt_gate = required_tensorf(m, "blk.%u.attn_dt.weight", il);
-            l->attn_a_norm = required_tensorf(m, "blk.%u.attn_qkv_norm.weight", il);
+            l->attn_qkv = required_tensorf(m, "blk.%u.attn_qkv.weight", il);
+            l->ssm_conv1d = required_tensorf(m, "blk.%u.ssm_conv1d.weight", il);
+            l->ssm_alpha = required_tensorf(m, "blk.%u.ssm_alpha.weight", il);
+            l->ssm_beta = required_tensorf(m, "blk.%u.ssm_beta.weight", il);
+            l->ssm_dt_bias = required_tensorf(m, "blk.%u.ssm_dt.bias", il);
+            l->ssm_a = required_tensorf(m, "blk.%u.ssm_a", il);
+            l->ssm_norm = required_tensorf(m, "blk.%u.ssm_norm.weight", il);
+            l->ssm_out = required_tensorf(m, "blk.%u.ssm_out.weight", il);
+            l->attn_gate = required_tensorf(m, "blk.%u.attn_gate.weight", il);
+            l->post_attn_norm = required_tensorf(m, "blk.%u.post_attention_norm.weight", il);
         } else {
             // Gated Attention layer
             l->attn_q = required_tensorf(m, "blk.%u.attn_q.weight", il);
             l->attn_k = required_tensorf(m, "blk.%u.attn_k.weight", il);
             l->attn_v = required_tensorf(m, "blk.%u.attn_v.weight", il);
             l->attn_output = required_tensorf(m, "blk.%u.attn_output.weight", il);
-            l->attn_qk_norm = model_find_tensor(m, (char[]){0});  // optional
+            l->attn_q_norm = required_tensorf(m, "blk.%u.attn_q_norm.weight", il);
+            l->attn_k_norm = required_tensorf(m, "blk.%u.attn_k_norm.weight", il);
+            l->post_attn_norm = required_tensorf(m, "blk.%u.post_attention_norm.weight", il);
         }
     }
 }
 
 /* Validate every tensor type and dimension used by the pipeline. */
 static void weights_validate_layout(const q4_weights *w) {
-    tensor_expect_f16_layout(w->token_embd, 2, Q4_N_EMBD, Q4_N_VOCAB, 0);
-    tensor_expect_f16_layout(w->output_norm, 1, Q4_N_EMBD, 0, 0);
-    tensor_expect_q8_0_layout(w->output, 2, Q4_N_EMBD, Q4_N_VOCAB, 0);
+    tensor_expect_q4_k_layout(w->token_embd, 2, Q4_N_EMBD, Q4_N_VOCAB, 0);
+    tensor_expect_f32_layout(w->output_norm, 1, Q4_N_EMBD, 0, 0);
+    tensor_expect_q6_k_layout(w->output, 2, Q4_N_EMBD, Q4_N_VOCAB, 0);
 
     for (uint32_t il = 0; il < Q4_N_LAYER; il++) {
         const q4_layer_weights *l = &w->layer[il];
 
         tensor_expect_f32_layout(l->attn_norm, 1, Q4_N_EMBD, 0, 0);
-        tensor_expect_f32_layout(l->ffn_norm, 1, Q4_N_EMBD, 0, 0);
-        tensor_expect_q8_0_layout(l->ffn_gate, 2, Q4_N_EMBD, Q4_N_FFN, 0);
-        tensor_expect_q8_0_layout(l->ffn_up, 2, Q4_N_EMBD, Q4_N_FFN, 0);
-        tensor_expect_q8_0_layout(l->ffn_down, 2, Q4_N_FFN, Q4_N_EMBD, 0);
+        tensor_expect_f32_layout(l->post_attn_norm, 1, Q4_N_EMBD, 0, 0);
+        tensor_expect_q4_k_layout(l->ffn_gate, 2, Q4_N_EMBD, Q4_N_FFN, 0);
+        tensor_expect_q4_k_layout(l->ffn_up, 2, Q4_N_EMBD, Q4_N_FFN, 0);
+        /* ffn_down can be Q4_K or Q6_K depending on layer */
+        if (l->ffn_down->type != Q4_TENSOR_Q4_K && l->ffn_down->type != Q4_TENSOR_Q6_K) {
+            fprintf(stderr, "q4: ffn_down type mismatch\n");
+            exit(1);
+        }
+        if (l->ffn_down->dim[0] != Q4_N_FFN || l->ffn_down->dim[1] != Q4_N_EMBD) {
+            fprintf(stderr, "q4: ffn_down dim mismatch\n");
+            exit(1);
+        }
 
         if (layer_is_deltanet(il)) {
-            tensor_expect_f16_layout(l->attn_a_gate, 2, Q4_N_EMBD, Q4_N_HEAD_KV * Q4_HEAD_DIM, 0);
-            tensor_expect_f16_layout(l->attn_b_proj, 2, Q4_N_EMBD, Q4_N_HEAD_KV * Q4_HEAD_DIM, 0);
-            tensor_expect_f16_layout(l->attn_dt_gate, 2, Q4_N_EMBD, Q4_N_HEAD_KV * Q4_HEAD_DIM, 0);
-            tensor_expect_f32_layout(l->attn_a_norm, 1, Q4_N_EMBD, 0, 0);
+            /* attn_qkv: [n_embd, qkv_dim] Q4_K or Q6_K */
+            if (l->attn_qkv->type != Q4_TENSOR_Q4_K && l->attn_qkv->type != Q4_TENSOR_Q6_K) { fprintf(stderr, "q4: attn_qkv type\n"); exit(1); }
+            if (l->attn_qkv->dim[0] != Q4_N_EMBD || l->attn_qkv->dim[1] != 10240) { fprintf(stderr, "q4: attn_qkv dim\n"); exit(1); }
+            /* ssm_conv1d: [conv_kernel, qkv_dim] F32 */
+            tensor_expect_f32_layout(l->ssm_conv1d, 2, 4, 10240, 0);
+            /* ssm_alpha: [n_embd, n_v_heads] F32 */
+            tensor_expect_f32_layout(l->ssm_alpha, 2, Q4_N_EMBD, 48, 0);
+            /* ssm_beta: [n_embd, n_v_heads] F32 */
+            tensor_expect_f32_layout(l->ssm_beta, 2, Q4_N_EMBD, 48, 0);
+            /* ssm_dt_bias: [n_v_heads] F32 */
+            tensor_expect_f32_layout(l->ssm_dt_bias, 1, 48, 0, 0);
+            /* ssm_a: [n_v_heads] F32 */
+            tensor_expect_f32_layout(l->ssm_a, 1, 48, 0, 0);
+            /* ssm_norm: [head_v_dim] F32 */
+            tensor_expect_f32_layout(l->ssm_norm, 1, 128, 0, 0);
+            /* ssm_out: [n_v_heads*head_v_dim, n_embd] Q5_K */
+            tensor_expect_q5_k_layout(l->ssm_out, 2, 6144, Q4_N_EMBD, 0);
+            /* attn_gate: [n_embd, n_v_heads*head_v_dim] Q4_K */
+            tensor_expect_q4_k_layout(l->attn_gate, 2, Q4_N_EMBD, 6144, 0);
+            /* post_attn_norm: [n_embd] F32 */
+            tensor_expect_f32_layout(l->post_attn_norm, 1, Q4_N_EMBD, 0, 0);
         } else {
-            tensor_expect_q8_0_layout(l->attn_q, 2, Q4_N_EMBD, Q4_N_HEAD * Q4_HEAD_DIM, 0);
-            tensor_expect_q8_0_layout(l->attn_k, 2, Q4_N_EMBD, Q4_N_HEAD_KV * Q4_HEAD_DIM, 0);
-            tensor_expect_q8_0_layout(l->attn_v, 2, Q4_N_EMBD, Q4_N_HEAD_KV * Q4_HEAD_DIM, 0);
-            tensor_expect_q8_0_layout(l->attn_output, 2, Q4_N_HEAD * Q4_HEAD_DIM, Q4_N_EMBD, 0);
+            /* attn_q: [n_embd, n_head*q_head_dim] Q4_K */
+            tensor_expect_q4_k_layout(l->attn_q, 2, Q4_N_EMBD, 12288, 0);
+            /* attn_k: [n_embd, n_head_kv*head_dim] Q4_K */
+            tensor_expect_q4_k_layout(l->attn_k, 2, Q4_N_EMBD, 1024, 0);
+            /* attn_v: [n_embd, n_head_kv*head_dim] Q4_K or Q6_K */
+            if (l->attn_v->type != Q4_TENSOR_Q4_K && l->attn_v->type != Q4_TENSOR_Q6_K) { fprintf(stderr, "q4: attn_v type\n"); exit(1); }
+            if (l->attn_v->dim[0] != Q4_N_EMBD || l->attn_v->dim[1] != 1024) { fprintf(stderr, "q4: attn_v dim\n"); exit(1); }
+            /* attn_output: [n_head*q_head_dim, n_embd] Q4_K */
+            tensor_expect_q4_k_layout(l->attn_output, 2, 6144, Q4_N_EMBD, 0);
+            /* attn_q_norm: [256] F32 - normalized over first 256 dims of Q head */
+            tensor_expect_f32_layout(l->attn_q_norm, 1, 256, 0, 0);
+            /* attn_k_norm: [head_dim=256] F32 */
+            tensor_expect_f32_layout(l->attn_k_norm, 1, 256, 0, 0);
+            /* post_attn_norm: [n_embd] F32 */
+            tensor_expect_f32_layout(l->post_attn_norm, 1, Q4_N_EMBD, 0, 0);
         }
     }
 }
@@ -1109,9 +1225,11 @@ static void vocab_load(q4_vocab *v, const q4_model *m) {
     v->bos_token = -1;
     v->eos_token = -1;
 
-    q4_str s;
-    if (!model_get_string(m, "tokenizer.ggml.tokens", &s)) {
-        q4_die("required tokenizer.ggml.tokens metadata key is missing");
+    /* tokenizer.ggml.tokens is a string array, not a single string.
+     * Check that the key exists and is an array; the loop below reads it. */
+    q4_kv *kv_check = model_find_kv(m, "tokenizer.ggml.tokens");
+    if (!kv_check || kv_check->type != GGUF_VALUE_ARRAY) {
+        q4_die("required tokenizer.ggml.tokens metadata key is missing or is not an array");
     }
 
     q4_kv *kv = model_find_kv(m, "tokenizer.ggml.tokens");
@@ -1483,6 +1601,138 @@ static void matvec_any(float *out, const q4_model *m, const q4_tensor *w, const 
         }
         break;
     }
+    case Q4_TENSOR_Q4_K: {
+        /* Q4_K dequantize + F32 matvec */
+        const uint64_t in_dim = w->dim[0];
+        const uint64_t out_dim = w->dim[1];
+        const uint64_t blocks = in_dim / QK_K;
+        const block_q4_K *data = tensor_data(m, w);
+        float *w_f32 = xmalloc(in_dim * sizeof(float));
+        for (uint64_t row = 0; row < out_dim; row++) {
+            const block_q4_K *row_b = data + row * blocks;
+            for (uint64_t b = 0; b < blocks; b++) {
+                const block_q4_K *xb = &row_b[b];
+                const float d = f16_to_f32(xb->d);
+                const float dm = f16_to_f32(xb->dmin);
+                for (short e = 0; e < QK_K; e++) {
+                    const short grp = e / 32;
+                    const short pos = e % 32;
+                    const short sub = pos / 16;
+                    const short idx = pos % 16;
+                    const bool is_high = grp >= 6;
+                    const float dmul = is_high ? (d / 16.0f) : d;
+                    float sc, mn;
+                    if (grp < 6) {
+                        sc = (float)(xb->scales[grp] & 0x3F);
+                        mn = (float)(xb->scales[6 + grp] & 0x3F);
+                    } else {
+                        const short gi = grp - 6;
+                        sc = (float)((xb->scales[4 + gi] >> 4) | ((xb->scales[gi] & 0xC0) >> 2));
+                        mn = (float)((xb->scales[10 + gi] >> 4) | ((xb->scales[6 + gi] & 0xC0) >> 2));
+                    }
+                    const short qs_off = (grp / 2) * 32 + sub * 16;
+                    const uint8_t qbyte = xb->qs[qs_off + idx];
+                    const uint8_t mask = sub == 0 ? 0x0F : 0xF0;
+                    const float q = (float)((qbyte & mask) >> (sub * 4));
+                    w_f32[b * QK_K + e] = dmul * sc * q - dm * mn;
+                }
+            }
+            double acc = 0.0;
+            for (uint64_t i = 0; i < in_dim; i++) acc += (double)w_f32[i] * x[i];
+            out[row] = (float)acc;
+            if (row == 0 && in_dim == 5120 && out_dim == 17408) {
+                double w_abs_sum = 0, w_max = 0;
+                for (uint64_t i = 0; i < in_dim; i++) {
+                    w_abs_sum += fabs(w_f32[i]);
+                    if (fabs(w_f32[i]) > w_max) w_max = fabs(w_f32[i]);
+                }
+                fprintf(stderr, "Q4K_WDBG: row=0 w_abs_avg=%.6f w_max=%.6f out=%.4f\n",
+                        w_abs_sum / in_dim, w_max, out[0]);
+            }
+        }
+        free(w_f32);
+        break;
+    }
+    case Q4_TENSOR_Q5_K: {
+        /* Q5_K dequantize + F32 matvec */
+        const uint64_t in_dim = w->dim[0];
+        const uint64_t out_dim = w->dim[1];
+        const uint64_t blocks = in_dim / QK_K;
+        const block_q5_K *data = tensor_data(m, w);
+        float *w_f32 = xmalloc(in_dim * sizeof(float));
+        for (uint64_t row = 0; row < out_dim; row++) {
+            const block_q5_K *row_b = data + row * blocks;
+            for (uint64_t b = 0; b < blocks; b++) {
+                const block_q5_K *xb = &row_b[b];
+                const float d = f16_to_f32(xb->d);
+                const float dm = f16_to_f32(xb->dmin);
+                for (short e = 0; e < QK_K; e++) {
+                    const short grp = e / 32;
+                    const short pos = e % 32;
+                    const short sub = pos / 16;
+                    const short idx = pos % 16;
+                    const bool is_high = grp >= 6;
+                    const float dmul = is_high ? (d / 16.0f) : d;
+                    float sc, mn;
+                    if (grp < 6) {
+                        sc = (float)(xb->scales[grp] & 0x3F);
+                        mn = (float)(xb->scales[6 + grp] & 0x3F);
+                    } else {
+                        const short gi = grp - 6;
+                        sc = (float)((xb->scales[4 + gi] >> 4) | ((xb->scales[gi] & 0xC0) >> 2));
+                        mn = (float)((xb->scales[10 + gi] >> 4) | ((xb->scales[6 + gi] & 0xC0) >> 2));
+                    }
+                    const short qs_off = (grp / 2) * 32 + sub * 16;
+                    uint8_t q = xb->qs[qs_off + idx];
+                    const uint8_t mask = sub == 0 ? 0x0F : 0xF0;
+                    q = (q & mask) >> (sub * 4);
+                    /* High bit from qh: 1 bit per element, packed 8 per byte */
+                    const uint8_t h = (xb->qh[e / 8] >> (e % 8)) & 0x01;
+                    q |= (h << 4);
+                    w_f32[b * QK_K + e] = dmul * (float)q - dm * mn;
+                }
+            }
+            double acc = 0.0;
+            for (uint64_t i = 0; i < in_dim; i++) acc += (double)w_f32[i] * x[i];
+            out[row] = (float)acc;
+        }
+        free(w_f32);
+        break;
+    }
+    case Q4_TENSOR_Q6_K: {
+        /* Q6_K dequantize + F32 matvec */
+        const uint64_t in_dim = w->dim[0];
+        const uint64_t out_dim = w->dim[1];
+        const uint64_t blocks = in_dim / QK_K;
+        const block_q6_K *data = tensor_data(m, w);
+        float *w_f32 = xmalloc(in_dim * sizeof(float));
+        for (uint64_t row = 0; row < out_dim; row++) {
+            const block_q6_K *row_b = data + row * blocks;
+            for (uint64_t b = 0; b < blocks; b++) {
+                const block_q6_K *xb = &row_b[b];
+                const float d = f16_to_f32(xb->d);
+                for (short e = 0; e < QK_K; e++) {
+                    const short q = e / 64;       /* quarter 0..3 */
+                    const short p = e % 64;       /* position within quarter 0..63 */
+                    /* ql: 32 bytes per quarter, 2 elements per byte */
+                    const int ql_idx = q * 32 + p / 2;
+                    const uint8_t qlo = (xb->ql[ql_idx] >> ((p % 2) * 4)) & 0x0F;
+                    /* qh: 16 bytes per quarter, 4 elements per byte */
+                    const int qh_idx = q * 16 + p / 4;
+                    const uint8_t qhi = (xb->qh[qh_idx] >> ((p % 4) * 2)) & 0x03;
+                    /* scales: 4 per quarter */
+                    const int s_idx = q * 4 + p / 16;
+                    const int8_t q_val = (int8_t)((qlo | (qhi << 4)) - 32);
+                    w_f32[b * QK_K + e] = d * xb->scales[s_idx] * q_val;
+                }
+            }
+            double acc = 0.0;
+            for (uint64_t i = 0; i < in_dim; i++) acc += (double)w_f32[i] * x[i];
+            out[row] = (float)acc;
+        }
+        free(w_f32);
+        break;
+    }
     default:
         fprintf(stderr, "q4: unsupported tensor type %u for matvec\n", w->type);
         exit(1);
@@ -1549,40 +1799,227 @@ static void ffn_swiglu_cpu(float *out, const q4_model *m, const q4_layer_weights
 }
 
 /* =========================================================================
- * Gated DeltaNet (CPU reference).
+ * Gated DeltaNet (CPU reference) - Gated DeltaNet (SSM) step for decode.
+ * Implements: qkv = conv1d(matvec(x, W_qkv)), L2-norm q/k,
+ * alpha/beta projections, delta rule state update, SiLU gate, RMS norm.
  * ========================================================================= */
 
-static void deltanet_step_cpu(float *out_state, const q4_model *m, const q4_layer_weights *l,
-                              const float *x, float *state) {
-    const uint32_t n_kv_heads = Q4_N_HEAD_KV;
-    const uint32_t head_dim = Q4_HEAD_DIM;
+static float softplus_f(float x) {
+    /* numerically stable softplus: log(1 + exp(x)) */
+    if (x > 20.0f) return x;
+    if (x < -20.0f) return 0.0f;
+    return log1pf(expf(x));
+}
+
+static float sigmoid_f(float x) {
+    if (x > 20.0f) return 1.0f;
+    if (x < -20.0f) return 0.0f;
+    return 1.0f / (1.0f + expf(-x));
+}
+
+static float l2_norm(const float *v, int n) {
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) sum += v[i] * v[i];
+    return sqrtf(sum);
+}
+
+/* Causal 1D conv: out[d] = sum_{k=0}^{kernel-1} w[k,d] * buf[pos-k, d] */
+static void conv1d_step(const float *w, const float *buf, uint32_t pos,
+                        int kernel, int dim, float *out) {
+    for (int d = 0; d < dim; d++) {
+        float acc = 0.0f;
+        for (int k = 0; k < kernel; k++) {
+            int idx = (int)pos - k;
+            if (idx < 0) idx += kernel;
+            acc += w[k * dim + d] * buf[idx * dim + d];
+        }
+        out[d] = acc;
+    }
+}
+
+static void deltanet_step_cpu(float *hidden_out, float *out_state,
+                              const q4_model *m, const q4_layer_weights *l,
+                              const float *normed, float *state,
+                              float *conv_buf, uint32_t *conv_pos) {
     const uint32_t n_embd = Q4_N_EMBD;
+    const uint32_t n_v_heads = Q4_N_V_HEADS;       /* 48 */
+    const uint32_t n_k_groups = Q4_N_K_GROUPS;      /* 16 */
+    const uint32_t head_k_dim = Q4_HEAD_K_DIM;      /* 128 */
+    const uint32_t head_v_dim = Q4_HEAD_V_DIM;      /* 128 */
+    const uint32_t qkv_dim = Q4_QKV_DIM;            /* 10240 */
+    const uint32_t conv_kernel = Q4_CONV_KERNEL;    /* 4 */
+    const uint32_t repeat = n_v_heads / n_k_groups; /* 3 */
 
-    // Project x to get a_gate, b_proj, dt_gate values
-    // In practice these are computed by small projections before this kernel
-    // For simplicity we assume they're already available
-    const float *a_gate = tensor_data(m, l->attn_a_gate);
-    const float *b_proj = tensor_data(m, l->attn_b_proj);
-    const float *dt_gate_data = tensor_data(m, l->attn_dt_gate);
+    /* Temporary buffers */
+    float *qkv_raw = xmalloc(qkv_dim * sizeof(float));
+    float *conv_qkv = xmalloc(qkv_dim * sizeof(float));
+    float *q_raw = xmalloc(n_k_groups * head_k_dim * sizeof(float));   /* 2048 */
+    float *k_raw = xmalloc(n_k_groups * head_k_dim * sizeof(float));   /* 2048 */
+    float *v_raw = xmalloc(n_v_heads * head_v_dim * sizeof(float));    /* 6144 */
+    float *q_exp = xmalloc(n_v_heads * head_k_dim * sizeof(float));
+    float *k_exp = xmalloc(n_v_heads * head_k_dim * sizeof(float));
+    float *delta = xmalloc(head_v_dim * sizeof(float));
+    float *z_raw = xmalloc(n_v_heads * head_v_dim * sizeof(float));
+    float *output = xmalloc(n_v_heads * head_v_dim * sizeof(float));
 
-    // For decode: x is the input, state is the recurrent state
-    // s' = (1 - dt) * s + dt * (b * v)
-    // Here we simplify: v comes from a projection of x
-    for (uint32_t kv = 0; kv < n_kv_heads; kv++) {
-        const uint32_t base = kv * head_dim;
-        for (uint32_t d = 0; d < head_dim; d++) {
-            const uint32_t idx = base + d;
-            // F16 weights
-            const float a = f16_to_f32(((const uint16_t *)a_gate)[idx]);
-            const float b = f16_to_f32(((const uint16_t *)b_proj)[idx]);
-            const float dt = f16_to_f32(((const uint16_t *)dt_gate_data)[idx]);
-            const float v = x[kv * head_dim + d];  // simplified input
+    /* Step 1: qkv_raw = matvec(hidden, attn_qkv) */
+    matvec_any(qkv_raw, m, l->attn_qkv, normed);
 
-            const float s = state[idx];
-            const float s_new = (1.0f - dt) * s + dt * b * v;
-            out_state[idx] = s_new;
+    /* Step 2: conv1d on qkv_raw */
+    /* First, write qkv_raw into conv_buf at current position */
+    {
+        float *conv_buf_w = conv_buf + (*conv_pos) * qkv_dim;
+        memcpy(conv_buf_w, qkv_raw, qkv_dim * sizeof(float));
+    }
+
+    const float *conv_w = tensor_data(m, l->ssm_conv1d);
+    conv1d_step(conv_w, conv_buf, *conv_pos, conv_kernel, qkv_dim, conv_qkv);
+    *conv_pos = (*conv_pos + 1) % conv_kernel;
+
+    /* Step 3: Split conv_qkv into q, k, v */
+    const uint32_t k_dim = n_k_groups * head_k_dim;  /* 2048 */
+    memcpy(q_raw, conv_qkv, k_dim * sizeof(float));
+    memcpy(k_raw, conv_qkv + k_dim, k_dim * sizeof(float));
+    memcpy(v_raw, conv_qkv + 2 * k_dim, (qkv_dim - 2 * k_dim) * sizeof(float));
+
+    /* Step 4: L2 norm q and k per group */
+    {
+        for (uint32_t g = 0; g < n_k_groups; g++) {
+            float nq = l2_norm(q_raw + g * head_k_dim, head_k_dim);
+            float nk = l2_norm(k_raw + g * head_k_dim, head_k_dim);
+            if (nq > 1.0e-6f) {
+                float inv = 1.0f / nq;
+                for (uint32_t d = 0; d < head_k_dim; d++) q_raw[g * head_k_dim + d] *= inv;
+            }
+            if (nk > 1.0e-6f) {
+                float inv = 1.0f / nk;
+                for (uint32_t d = 0; d < head_k_dim; d++) k_raw[g * head_k_dim + d] *= inv;
+            }
         }
     }
+
+    /* Step 5: alpha_raw = matvec(normed, ssm_alpha), beta_raw = matvec(normed, ssm_beta) */
+    float *alpha_raw = xmalloc(n_v_heads * sizeof(float));
+    float *beta_raw = xmalloc(n_v_heads * sizeof(float));
+    matvec_any(alpha_raw, m, l->ssm_alpha, normed);
+    matvec_any(beta_raw, m, l->ssm_beta, normed);
+
+    /* Step 6: alpha_biased = alpha_raw + ssm_dt_bias, gate = softplus(alpha_biased) * ssm_a */
+    const float *dt_bias = tensor_data(m, l->ssm_dt_bias);
+    const float *ssm_a_data = tensor_data(m, l->ssm_a);
+    float *gate = xmalloc(n_v_heads * sizeof(float));
+    for (uint32_t i = 0; i < n_v_heads; i++) {
+        float biased = alpha_raw[i] + dt_bias[i];
+        float sp = softplus_f(biased);
+        gate[i] = sp * ssm_a_data[i];
+    }
+
+    /* Step 7: beta = sigmoid(beta_raw) */
+    for (uint32_t i = 0; i < n_v_heads; i++) {
+        beta_raw[i] = sigmoid_f(beta_raw[i]);
+    }
+
+    /* Step 8: Expand q, k from key_heads(16) to value_heads(48) */
+    for (uint32_t g = 0; g < n_k_groups; g++) {
+        for (uint32_t r = 0; r < repeat; r++) {
+            memcpy(q_exp + (g * repeat + r) * head_k_dim,
+                   q_raw + g * head_k_dim,
+                   head_k_dim * sizeof(float));
+            memcpy(k_exp + (g * repeat + r) * head_k_dim,
+                   k_raw + g * head_k_dim,
+                   head_k_dim * sizeof(float));
+        }
+    }
+
+    /* Step 9: Delta rule per v_head */
+    for (uint32_t i = 0; i < n_v_heads; i++) {
+        float *state_i = state + i * head_v_dim * head_k_dim;
+        const float *k_i = k_exp + i * head_k_dim;
+        const float *v_i = v_raw + i * head_v_dim;
+        float gi = gate[i];
+        float bi = beta_raw[i];
+        float eg = expf(gi);
+
+        /* sk = state @ k */
+        for (uint32_t d = 0; d < head_v_dim; d++) {
+            float acc = 0.0f;
+            for (uint32_t j = 0; j < head_k_dim; j++) {
+                acc += state_i[d * head_k_dim + j] * k_i[j];
+            }
+            delta[d] = v_i[d] - acc;
+        }
+
+        /* state = state * eg + bi * outer(delta, k) */
+        for (uint32_t d = 0; d < head_v_dim; d++) {
+            for (uint32_t j = 0; j < head_k_dim; j++) {
+                state_i[d * head_k_dim + j] = state_i[d * head_k_dim + j] * eg + bi * delta[d] * k_i[j];
+            }
+        }
+
+        /* output = state @ k */
+        for (uint32_t d = 0; d < head_v_dim; d++) {
+            float acc = 0.0f;
+            for (uint32_t j = 0; j < head_k_dim; j++) {
+                acc += state_i[d * head_k_dim + j] * k_i[j];
+            }
+            output[d + i * head_v_dim] = acc;
+        }
+    }
+
+    free(alpha_raw);
+    free(beta_raw);
+    free(gate);
+
+    /* Step 10: z = matvec(normed, attn_gate), output *= silu(z) */
+    matvec_any(z_raw, m, l->attn_gate, normed);
+
+    const float *ssm_norm_w = tensor_data(m, l->ssm_norm);
+
+    for (uint32_t i = 0; i < n_v_heads; i++) {
+        float *out_i = output + i * head_v_dim;
+        const float *z_i = z_raw + i * head_v_dim;
+
+        /* silu gate */
+        for (uint32_t d = 0; d < head_v_dim; d++) {
+            out_i[d] *= z_i[d] * sigmoid_f(z_i[d]);
+        }
+
+        /* RMS norm over head_v_dim */
+        float ss = 0.0f;
+        for (uint32_t d = 0; d < head_v_dim; d++) ss += out_i[d] * out_i[d];
+        float rms = sqrtf(ss / head_v_dim + Q4_RMS_EPS);
+        for (uint32_t d = 0; d < head_v_dim; d++) {
+            out_i[d] = out_i[d] / rms * ssm_norm_w[d];
+        }
+    }
+
+    /* Step 11: Copy output to hidden_out [n_v_heads * head_v_dim = 6144] */
+    memcpy(hidden_out, output, n_v_heads * head_v_dim * sizeof(float));
+
+    /* Step 12: Project to n_embd via ssm_out */
+    float *proj_tmp = xmalloc(n_embd * sizeof(float));
+
+    /* Skip ssm_out matvec if hidden_out is effectively zero (avoids Q5_K dequant NaN) */
+    {
+        float h_max = 0;
+        for (uint32_t i = 0; i < n_v_heads * head_v_dim; i++) {
+            float v = fabsf(hidden_out[i]);
+            if (v > h_max) h_max = v;
+        }
+        if (h_max < 1e-10f) {
+            memset(proj_tmp, 0, n_embd * sizeof(float));
+        } else {
+            matvec_any(proj_tmp, m, l->ssm_out, hidden_out);
+        }
+    }
+    memcpy(hidden_out, proj_tmp, n_embd * sizeof(float));
+    free(proj_tmp);
+
+    /* Step 13: Copy state back */
+    memcpy(out_state, state, n_v_heads * head_v_dim * head_k_dim * sizeof(float));
+
+    free(qkv_raw); free(conv_qkv); free(q_raw); free(k_raw); free(v_raw);
+    free(q_exp); free(k_exp); free(delta); free(z_raw); free(output);
 }
 
 /* =========================================================================
@@ -1591,32 +2028,34 @@ static void deltanet_step_cpu(float *out_state, const q4_model *m, const q4_laye
 
 static void attention_decode_cpu(float *out, const q4_model *m, const q4_layer_weights *l,
                                  const float *x, const float *k_cache, const float *v_cache,
-                                 uint32_t kv_len, uint32_t pos, float logit_softcap) {
+                                 uint32_t kv_len, uint32_t pos, float logit_softcap,
+                                 float rope_freq_base) {
     const uint32_t n_q_heads = Q4_N_HEAD;
     const uint32_t n_kv_heads = Q4_N_HEAD_KV;
-    const uint32_t head_dim = Q4_HEAD_DIM;
+    const uint32_t q_head_dim = Q4_Q_HEAD_DIM;    /* 512 */
+    const uint32_t kv_head_dim = Q4_HEAD_DIM;     /* 256 */
     const uint32_t n_embd = Q4_N_EMBD;
     const uint32_t q_per_kv = Q4_Q_PER_KV;
-    const float inv_sqrt_d = 1.0f / sqrtf((float)head_dim);
+    const float inv_sqrt_d = 1.0f / sqrtf((float)kv_head_dim);
 
-    // Q = x @ W_q
-    float *q = xmalloc(n_q_heads * head_dim * sizeof(float));
+    // Q = x @ W_q  -> [n_q_heads * q_head_dim = 24 * 512 = 12288]
+    float *q = xmalloc(n_q_heads * q_head_dim * sizeof(float));
     matvec_any(q, m, l->attn_q, x);
 
-    // RoPE applied to Q (full)
-    rope_full_cpu(q, 1, n_q_heads, head_dim, pos, 10000.0f);
+    // RoPE applied to Q (only first rope.dimension_count=64 dims are rotated)
+    rope_full_cpu(q, 1, n_q_heads, q_head_dim, pos, rope_freq_base);
 
     for (uint32_t qh = 0; qh < n_q_heads; qh++) {
         const uint32_t kv_h = qh / q_per_kv;
-        const float *q_h = q + qh * head_dim;
+        const float *q_h = q + qh * q_head_dim;
 
         // Compute attention scores
         float *scores = xmalloc(kv_len * sizeof(float));
         float max_val = Q4_NEG_INF;
         for (uint32_t t = 0; t < kv_len; t++) {
-            const float *k_t = k_cache + (kv_h * head_dim) + (t * n_kv_heads * head_dim);
+            const float *k_t = k_cache + (kv_h * kv_head_dim) + (t * n_kv_heads * kv_head_dim);
             float score = 0.0f;
-            for (uint32_t d = 0; d < head_dim; d++) {
+            for (uint32_t d = 0; d < kv_head_dim; d++) {
                 score += q_h[d] * k_t[d];
             }
             score *= inv_sqrt_d;
@@ -1635,13 +2074,13 @@ static void attention_decode_cpu(float *out, const q4_model *m, const q4_layer_w
         }
         const float inv_sum = 1.0f / sum;
 
-        // Weighted sum of V
-        float *out_h = out + qh * head_dim;
-        for (uint32_t d = 0; d < head_dim; d++) out_h[d] = 0.0f;
+        // Weighted sum of V -> [kv_head_dim] per Q head
+        float *out_h = out + qh * kv_head_dim;
+        for (uint32_t d = 0; d < kv_head_dim; d++) out_h[d] = 0.0f;
         for (uint32_t t = 0; t < kv_len; t++) {
-            const float *v_t = v_cache + (kv_h * head_dim) + (t * n_kv_heads * head_dim);
+            const float *v_t = v_cache + (kv_h * kv_head_dim) + (t * n_kv_heads * kv_head_dim);
             const float w = scores[t] * inv_sum;
-            for (uint32_t d = 0; d < head_dim; d++) {
+            for (uint32_t d = 0; d < kv_head_dim; d++) {
                 out_h[d] += w * v_t[d];
             }
         }
@@ -1649,7 +2088,7 @@ static void attention_decode_cpu(float *out, const q4_model *m, const q4_layer_w
         free(scores);
     }
 
-    // Output projection
+    // Output projection: [n_q_heads * kv_head_dim = 24*256 = 6144] -> [n_embd]
     float *tmp = xmalloc(n_embd * sizeof(float));
     matvec_any(tmp, m, l->attn_output, out);
     memcpy(out, tmp, n_embd * sizeof(float));
@@ -1677,9 +2116,17 @@ struct q4_session {
     int ctx_size;
 
     // KV cache
-    float *k_cache;  // [ctx_size, n_kv_heads, head_dim]
-    float *v_cache;  // [ctx_size, n_kv_heads, head_dim]
+    float *k_cache;  // [ctx_size, n_kv_heads=4, head_dim=256]
+    float *v_cache;  // [ctx_size, n_kv_heads=4, head_dim=256]
     uint32_t kv_len;
+
+    // SSM state per layer: [n_layer, n_v_heads=48, head_v_dim=128, head_k_dim=128]
+    float *ssm_state;
+
+    // Conv buffer per layer: [n_layer, conv_kernel=4, qkv_dim=10240]
+    // Stored as circular buffer: conv_pos wraps around
+    float *conv_buf;
+    uint32_t *conv_pos;  // [n_layer] current write position in conv buffer
 
     // Token buffer
     int *tokens;
@@ -1687,6 +2134,21 @@ struct q4_session {
 
     // Logits
     float *logits;
+
+#ifndef Q4_NO_GPU
+    // GPU-side state (allocated when backend uses GPU)
+    q4_gpu_tensor *gpu_hidden;      /* [n_embd] F32 */
+    q4_gpu_tensor *gpu_residual;    /* [n_embd] F32 */
+    q4_gpu_tensor *gpu_normed;      /* [n_embd] F32 */
+    q4_gpu_tensor *gpu_logits;      /* [n_vocab] F32 */
+    q4_gpu_tensor *gpu_kv_k;        /* [ctx_size, n_kv_heads, head_dim] F32 */
+    q4_gpu_tensor *gpu_kv_v;        /* [ctx_size, n_kv_heads, head_dim] F32 */
+    q4_gpu_tensor *gpu_ssm_state;   /* [n_layer, n_v_heads, head_v_dim, head_k_dim] F32 */
+    q4_gpu_tensor *gpu_conv_buf;    /* [n_layer, Q4_CONV_KERNEL, Q4_QKV_DIM] F32 ring buffer */
+    /* Scratch buffers reused across layers */
+    q4_gpu_tensor *gpu_scratch;     /* large scratch buffer */
+    uint64_t gpu_scratch_offset;    /* current offset in scratch */
+#endif
 };
 
 /* =========================================================================
@@ -1863,22 +2325,24 @@ int q4_engine_open(q4_engine **out, const q4_engine_options *opt) {
     model_open(&e->model, opt->model_path, metal_mapping);
 
     // Load config from GGUF metadata
-    e->config.n_layer = required_u32(&e->model, "qwen3.block_count");
-    e->config.n_embd = required_u32(&e->model, "qwen3.embedding_length");
-    e->config.n_vocab = required_u32(&e->model, "qwen3.vocab_size");
-    e->config.n_head = required_u32(&e->model, "qwen3.attention.head_count");
-    e->config.n_head_kv = required_u32(&e->model, "qwen3.attention.head_count_kv");
-    e->config.head_dim = required_u32(&e->model, "qwen3.attention.key_length");
-    e->config.n_ffn = required_u32(&e->model, "qwen3.feed_forward_length");
+    e->config.n_layer = required_u32(&e->model, "qwen35.block_count");
+    e->config.n_embd = required_u32(&e->model, "qwen35.embedding_length");
+    e->config.n_head = required_u32(&e->model, "qwen35.attention.head_count");
+    e->config.n_head_kv = required_u32(&e->model, "qwen35.attention.head_count_kv");
+    e->config.head_dim = required_u32(&e->model, "qwen35.attention.key_length");
+    e->config.n_ffn = required_u32(&e->model, "qwen35.feed_forward_length");
+    // vocab_size from embedding tensor (second dimension)
+    q4_tensor *token_embd = required_tensor(&e->model, "token_embd.weight");
+    e->config.n_vocab = (uint32_t)token_embd->dim[1];
 
     // Derived
     e->config.n_q_dim = e->config.n_head * e->config.head_dim;
     e->config.n_kv_dim = e->config.n_head_kv * e->config.head_dim;
 
     // Optional metadata
-    model_get_f32(&e->model, "qwen3.rope.freq_base", &e->rope_freq_base);
-    if (e->rope_freq_base < 1.0e-6f) e->rope_freq_base = 10000.0f;
-    model_get_f32(&e->model, "qwen3.attention.logit_softcap", &e->logit_softcap);
+    model_get_f32(&e->model, "qwen35.rope.freq_base", &e->rope_freq_base);
+    if (e->rope_freq_base < 1.0e-6f) e->rope_freq_base = 10000000.0f;
+    model_get_f32(&e->model, "qwen35.attention.logit_softcap", &e->logit_softcap);
 
     // Validate model config
     config_validate_model(&e->model);
@@ -1995,7 +2459,8 @@ q4_context_memory q4_context_memory_estimate(q4_backend backend, int ctx_size) {
 int q4_engine_tokenize(q4_engine *e, const char *text, int text_len,
                         q4_tokens **out_tokens) {
     if (!e || !text || text_len <= 0) return -1;
-    return vocab_tokenize(&e->vocab, text, text_len, out_tokens);
+    int n = vocab_tokenize(&e->vocab, text, text_len, out_tokens);
+    return n > 0 ? 0 : -1;
 }
 
 /* =========================================================================
@@ -2015,12 +2480,44 @@ int q4_session_create(q4_session **out, q4_engine *e, int ctx_size) {
     s->v_cache = xmalloc_zeroed((uint64_t)ctx_size, kv_head_bytes);
     s->kv_len = 0;
 
+    // SSM state: [n_layer, n_v_heads, head_v_dim, head_k_dim]
+    const uint64_t ssm_state_bytes = (uint64_t)Q4_N_LAYER * Q4_N_V_HEADS * Q4_HEAD_V_DIM * Q4_HEAD_K_DIM * sizeof(float);
+    s->ssm_state = xmalloc_zeroed(1, ssm_state_bytes);
+
+    // Conv buffer: [n_layer, conv_kernel, qkv_dim]
+    const uint64_t conv_buf_bytes = (uint64_t)Q4_N_LAYER * Q4_CONV_KERNEL * Q4_QKV_DIM * sizeof(float);
+    s->conv_buf = xmalloc_zeroed(1, conv_buf_bytes);
+    s->conv_pos = xmalloc_zeroed(Q4_N_LAYER, sizeof(uint32_t));
+
     // Token buffer
     s->tokens = xmalloc((size_t)ctx_size * sizeof(int));
     s->n_tokens = 0;
 
     // Logits (vocab-sized)
     s->logits = xmalloc((size_t)e->config.n_vocab * sizeof(float));
+
+#ifndef Q4_NO_GPU
+    // Allocate GPU-side state
+    if (q4_backend_uses_graph(e->backend)) {
+        const uint64_t embd_bytes = (uint64_t)Q4_N_EMBD * sizeof(float);
+        s->gpu_hidden   = q4_gpu_tensor_alloc(embd_bytes);
+        s->gpu_residual = q4_gpu_tensor_alloc(embd_bytes);
+        s->gpu_normed   = q4_gpu_tensor_alloc(embd_bytes);
+        s->gpu_logits   = q4_gpu_tensor_alloc((uint64_t)e->config.n_vocab * sizeof(float));
+        s->gpu_kv_k     = q4_gpu_tensor_alloc((uint64_t)ctx_size * kv_head_bytes);
+        s->gpu_kv_v     = q4_gpu_tensor_alloc((uint64_t)ctx_size * kv_head_bytes);
+        s->gpu_ssm_state = q4_gpu_tensor_alloc(ssm_state_bytes);
+        /* GPU conv buffer: [n_layer, Q4_CONV_KERNEL, Q4_QKV_DIM] F32 ring buffer */
+        const uint64_t conv_buf_bytes = (uint64_t)Q4_N_LAYER * Q4_CONV_KERNEL * Q4_QKV_DIM * sizeof(float);
+        s->gpu_conv_buf = q4_gpu_tensor_alloc(conv_buf_bytes);
+        /* Zero-initialize conv buffer */
+        q4_gpu_tensor_fill_f32(s->gpu_conv_buf, 0.0f, Q4_N_LAYER * Q4_CONV_KERNEL * Q4_QKV_DIM);
+        /* Scratch buffer: enough for Q [24*512], K/V [4*256], attn_out [5120], ffn_gate [17408], ffn_up [17408], ffn_out [5120] */
+        const uint64_t scratch_bytes = 512 * 1024;  /* 512 KB: attn Q/K/V/out (~78K) + FFN gate/up/out (~160K) + DeltaNet intermediates (~350K) */
+        s->gpu_scratch = q4_gpu_tensor_alloc(scratch_bytes);
+        s->gpu_scratch_offset = 0;
+    }
+#endif
 
     *out = s;
     return 0;
@@ -2030,8 +2527,22 @@ void q4_session_free(q4_session *s) {
     if (!s) return;
     free(s->k_cache);
     free(s->v_cache);
+    free(s->ssm_state);
+    free(s->conv_buf);
+    free(s->conv_pos);
     free(s->tokens);
     free(s->logits);
+#ifndef Q4_NO_GPU
+    q4_gpu_tensor_free(s->gpu_hidden);
+    q4_gpu_tensor_free(s->gpu_residual);
+    q4_gpu_tensor_free(s->gpu_normed);
+    q4_gpu_tensor_free(s->gpu_logits);
+    q4_gpu_tensor_free(s->gpu_kv_k);
+    q4_gpu_tensor_free(s->gpu_kv_v);
+    q4_gpu_tensor_free(s->gpu_ssm_state);
+    q4_gpu_tensor_free(s->gpu_conv_buf);
+    q4_gpu_tensor_free(s->gpu_scratch);
+#endif
     free(s);
 }
 
@@ -2063,11 +2574,46 @@ static void embed_token_cpu(const q4_model *m, const q4_tensor *te, int token, f
     if (token < 0 || (uint64_t)token >= te->dim[1]) {
         q4_die("token id is outside the embedding table");
     }
-    const uint16_t *base = tensor_data(m, te);
-    const uint64_t stride = te->dim[0];
-    const uint16_t *row = base + (uint64_t)token * stride;
-    for (uint64_t i = 0; i < stride; i++) {
-        out[i] = f16_to_f32(row[i]);
+    const uint64_t stride = te->dim[0];  /* n_embd */
+    const uint64_t token_off = (uint64_t)token * stride;
+
+    if (te->type == Q4_TENSOR_F16) {
+        const uint16_t *base = tensor_data(m, te);
+        const uint16_t *row = base + token_off;
+        for (uint64_t i = 0; i < stride; i++) {
+            out[i] = f16_to_f32(row[i]);
+        }
+    } else if (te->type == Q4_TENSOR_Q4_K) {
+        const block_q4_K *data = tensor_data(m, te);
+        const uint64_t blocks_per_row = stride / QK_K;
+        for (uint64_t b = 0; b < blocks_per_row; b++) {
+            const block_q4_K *xb = &data[token_off / QK_K * blocks_per_row + b];
+            const float d = f16_to_f32(xb->d);
+            const float dm = f16_to_f32(xb->dmin);
+            for (short e = 0; e < QK_K; e++) {
+                const short grp = e / 32;
+                const short pos = e % 32;
+                const short sub = pos / 16;
+                const short idx = pos % 16;
+                const float dmul = (grp >= 6) ? (d / 16.0f) : d;
+                float sc, mn;
+                if (grp < 6) {
+                    sc = (float)(xb->scales[grp] & 0x3F);
+                    mn = (float)(xb->scales[6 + grp] & 0x3F);
+                } else {
+                    const short gi = grp - 6;
+                    sc = (float)((xb->scales[4 + gi] >> 4) | ((xb->scales[gi] & 0xC0) >> 2));
+                    mn = (float)((xb->scales[10 + gi] >> 4) | ((xb->scales[6 + gi] & 0xC0) >> 2));
+                }
+                const short qs_off = (grp / 2) * 32 + sub * 16;
+                const uint8_t qbyte = xb->qs[qs_off + idx];
+                const uint8_t mask = sub == 0 ? 0x0F : 0xF0;
+                const float q = (float)((qbyte & mask) >> (sub * 4));
+                out[b * QK_K + e] = dmul * sc * q - dm * mn;
+            }
+        }
+    } else {
+        q4_die("embed_token_cpu: unsupported tensor type");
     }
 }
 
@@ -2078,7 +2624,6 @@ static int q4_cpu_forward(q4_engine *e, q4_session *s, int token, uint32_t pos, 
 
     float *hidden = xmalloc(n_embd * sizeof(float));
     float *residual = xmalloc(n_embd * sizeof(float));
-    float *deltanet_state = xmalloc_zeroed(Q4_N_HEAD_KV * Q4_HEAD_DIM, sizeof(float));
 
     // Embed token
     embed_token_cpu(&e->model, e->weights.token_embd, token, hidden);
@@ -2093,16 +2638,17 @@ static int q4_cpu_forward(q4_engine *e, q4_session *s, int token, uint32_t pos, 
         rms_norm_weight(normed, hidden, norm_weight, n_embd, Q4_RMS_EPS);
 
         if (layer_is_deltanet(il)) {
-            // DeltaNet: recurrent state update
-            // For simplicity: output = normed (full implementation needs projections)
-            // s' = (1 - dt) * s + dt * (b * v)
-            // Here we just pass through for now
-            memcpy(hidden, normed, n_embd * sizeof(float));
+            // DeltaNet: compute output from SSM state, project to hidden
+            float *layer_ssm_state = s->ssm_state + il * Q4_N_V_HEADS * Q4_HEAD_V_DIM * Q4_HEAD_K_DIM;
+            float *state_tmp = xmalloc(Q4_N_V_HEADS * Q4_HEAD_V_DIM * Q4_HEAD_K_DIM * sizeof(float));
+            float *conv_buf = s->conv_buf + il * Q4_CONV_KERNEL * Q4_QKV_DIM;
+            uint32_t *conv_pos = &s->conv_pos[il];
 
-            // Update DeltaNet state
-            deltanet_step_cpu(deltanet_state, &e->model, l, normed, deltanet_state);
-            // Copy state back to hidden (simplified)
-            // Full implementation would project state to n_embd
+            deltanet_step_cpu(hidden, state_tmp, &e->model, l, normed, layer_ssm_state, conv_buf, conv_pos);
+
+            // Copy updated state back to persistent storage
+            memcpy(layer_ssm_state, state_tmp, Q4_N_V_HEADS * Q4_HEAD_V_DIM * Q4_HEAD_K_DIM * sizeof(float));
+            free(state_tmp);
         } else {
             // Gated Attention
             float *attn_out = xmalloc(n_embd * sizeof(float));
@@ -2111,12 +2657,12 @@ static int q4_cpu_forward(q4_engine *e, q4_session *s, int token, uint32_t pos, 
             const uint32_t kv_idx = s->kv_len;
             if (kv_idx >= (uint32_t)s->ctx_size) {
                 if (err && errlen > 0) snprintf(err, errlen, "KV cache full");
-                free(normed); free(attn_out); free(hidden); free(residual); free(deltanet_state);
+                free(normed); free(attn_out); free(hidden); free(residual);
                 return -1;
             }
 
-            // For decode, we need to project Q, K, V
-            float *q = xmalloc(Q4_N_HEAD * Q4_HEAD_DIM * sizeof(float));
+            // Project Q, K, V
+            float *q = xmalloc(Q4_N_HEAD * Q4_Q_HEAD_DIM * sizeof(float));
             float *k = xmalloc(Q4_N_HEAD_KV * Q4_HEAD_DIM * sizeof(float));
             float *v = xmalloc(Q4_N_HEAD_KV * Q4_HEAD_DIM * sizeof(float));
 
@@ -2125,7 +2671,7 @@ static int q4_cpu_forward(q4_engine *e, q4_session *s, int token, uint32_t pos, 
             matvec_any(v, &e->model, l->attn_v, normed);
 
             // Apply RoPE to Q and K
-            rope_full_cpu(q, 1, Q4_N_HEAD, Q4_HEAD_DIM, pos, e->rope_freq_base);
+            rope_full_cpu(q, 1, Q4_N_HEAD, Q4_Q_HEAD_DIM, pos, e->rope_freq_base);
             rope_full_cpu(k, 1, Q4_N_HEAD_KV, Q4_HEAD_DIM, pos, e->rope_freq_base);
 
             // Store K, V
@@ -2133,9 +2679,11 @@ static int q4_cpu_forward(q4_engine *e, q4_session *s, int token, uint32_t pos, 
             memcpy(s->k_cache + kv_idx * Q4_N_HEAD_KV * Q4_HEAD_DIM, k, kv_head_bytes);
             memcpy(s->v_cache + kv_idx * Q4_N_HEAD_KV * Q4_HEAD_DIM, v, kv_head_bytes);
 
-            // Run attention
+            // Run attention (attention_decode_cpu will re-project Q internally, which is wasteful
+            // but the KV cache lookup and scoring are correct)
             attention_decode_cpu(attn_out, &e->model, l, normed,
-                               s->k_cache, s->v_cache, s->kv_len + 1, pos, e->logit_softcap);
+                               s->k_cache, s->v_cache, s->kv_len + 1, pos, e->logit_softcap,
+                               e->rope_freq_base);
 
             // Increment KV cache length
             s->kv_len++;
@@ -2146,17 +2694,21 @@ static int q4_cpu_forward(q4_engine *e, q4_session *s, int token, uint32_t pos, 
             free(attn_out);
         }
 
-        // Residual
+        // Post-attention/post-SSM norm + residual
+        float *post_normed = xmalloc(n_embd * sizeof(float));
+        const float *post_norm_weight = tensor_data(&e->model, l->post_attn_norm);
+        rms_norm_weight(post_normed, hidden, post_norm_weight, n_embd, Q4_RMS_EPS);
         for (uint32_t i = 0; i < n_embd; i++) {
-            hidden[i] += residual[i];
+            hidden[i] = post_normed[i] + residual[i];
         }
         memcpy(residual, hidden, n_embd * sizeof(float));
 
         free(normed);
+        free(post_normed);
 
         // FFN
         normed = xmalloc(n_embd * sizeof(float));
-        const float *ffn_norm_weight = tensor_data(&e->model, l->ffn_norm);
+        const float *ffn_norm_weight = tensor_data(&e->model, l->post_attn_norm);
         rms_norm_weight(normed, hidden, ffn_norm_weight, n_embd, Q4_RMS_EPS);
 
         float *ffn_out = xmalloc(n_embd * sizeof(float));
@@ -2177,14 +2729,412 @@ static int q4_cpu_forward(q4_engine *e, q4_session *s, int token, uint32_t pos, 
     rms_norm_weight(hidden, hidden, output_norm_w, n_embd, Q4_RMS_EPS);
 
     // Output projection (Q8_0)
-    matvec_q8_0(s->logits, &e->model, e->weights.output, hidden);
+    matvec_any(s->logits, &e->model, e->weights.output, hidden);
 
     free(hidden);
     free(residual);
-    free(deltanet_state);
 
     return 0;
 }
+
+/* =========================================================================
+ * GPU Inference Path.
+ * ========================================================================= */
+
+#ifndef Q4_NO_GPU
+/* Scratch allocator within the session's gpu_scratch tensor. */
+static uint64_t gpu_scratch_alloc(q4_session *s, uint64_t bytes) {
+    uint64_t offset = s->gpu_scratch_offset;
+    s->gpu_scratch_offset += bytes;
+    return offset;
+}
+
+static q4_gpu_tensor *gpu_scratch_view(q4_session *s, uint64_t offset, uint64_t bytes) {
+    q4_gpu_tensor *view = q4_gpu_tensor_view(s->gpu_scratch, offset, bytes);
+    return view;
+}
+
+static void gpu_scratch_reset(q4_session *s) {
+    s->gpu_scratch_offset = 0;
+}
+
+/* Run one token through the model on GPU. */
+static int q4_gpu_forward(q4_engine *e, q4_session *s, int token, uint32_t pos, char *err, size_t errlen) {
+    const uint32_t n_embd = Q4_N_EMBD;
+    const uint32_t n_layer = Q4_N_LAYER;
+    const uint64_t embd_bytes = n_embd * sizeof(float);
+    const uint64_t ffn_bytes = Q4_N_FFN * sizeof(float);
+    const uint64_t q_bytes = Q4_N_HEAD * Q4_Q_HEAD_DIM * sizeof(float);   /* 24*512*4 = 49152 */
+    const uint64_t kv_bytes = Q4_N_HEAD_KV * Q4_HEAD_DIM * sizeof(float);  /* 4*256*4 = 4096 */
+    const uint64_t kv_head_bytes = (uint64_t)Q4_N_HEAD_KV * Q4_HEAD_DIM * sizeof(float);
+
+    /* Reset scratch allocator */
+    gpu_scratch_reset(s);
+
+    /* 1. Embed token on CPU (fast: 5120 floats), upload to GPU */
+    float *host_hidden = xmalloc(embd_bytes);
+    embed_token_cpu(&e->model, e->weights.token_embd, token, host_hidden);
+    if (q4_gpu_tensor_write(s->gpu_hidden, 0, host_hidden, embd_bytes) != 0) {
+        free(host_hidden);
+        if (err && errlen > 0) snprintf(err, errlen, "failed to write hidden state");
+        return -1;
+    }
+    /* Copy hidden to residual for residual connection */
+    if (q4_gpu_tensor_copy(s->gpu_residual, 0, s->gpu_hidden, 0, embd_bytes) != 0) {
+        free(host_hidden);
+        return -1;
+    }
+    free(host_hidden);
+
+    /* Begin GPU command sequence */
+    if (q4_gpu_begin_commands() != 0) {
+        if (err && errlen > 0) snprintf(err, errlen, "failed to begin GPU commands");
+        return -1;
+    }
+
+    for (uint32_t il = 0; il < n_layer; il++) {
+        gpu_scratch_reset(s);
+
+        const q4_layer_weights *l = &e->weights.layer[il];
+        const void *model_map = e->model.map;
+        uint64_t model_size = e->model.size;
+
+        /* --- RMSNorm: gpu_hidden -> gpu_normed --- */
+        uint64_t norm_w_offset = l->attn_norm->abs_offset;
+        if (q4_gpu_rms_norm_weight_rows_tensor(s->gpu_normed, s->gpu_hidden,
+                model_map, model_size, norm_w_offset, n_embd, 1, Q4_RMS_EPS) != 0) {
+            if (err && errlen > 0) snprintf(err, errlen, "layer %u RMSNorm failed", il);
+            return -1;
+        }
+
+        if (layer_is_deltanet(il)) {
+            /* DeltaNet on GPU: chain matmuls + specialized kernels. */
+            const uint64_t qkv_raw_bytes = (uint64_t)Q4_QKV_DIM * sizeof(float);          /* 163840 */
+            const uint64_t small_bytes = Q4_N_V_HEADS * sizeof(float);                      /* 192 */
+            const uint64_t z_raw_bytes = (uint64_t)Q4_N_V_HEADS * Q4_HEAD_V_DIM * sizeof(float); /* 24576 */
+            const uint64_t expand_bytes = z_raw_bytes;                                       /* 24576 each */
+
+            uint64_t qkv_off = gpu_scratch_alloc(s, qkv_raw_bytes);
+            uint64_t alpha_off = gpu_scratch_alloc(s, small_bytes);
+            uint64_t beta_off = gpu_scratch_alloc(s, small_bytes);
+            uint64_t gate_off = gpu_scratch_alloc(s, small_bytes);
+            uint64_t beta_sig_off = gpu_scratch_alloc(s, small_bytes);
+            uint64_t z_off = gpu_scratch_alloc(s, z_raw_bytes);
+            uint64_t q_exp_off = gpu_scratch_alloc(s, expand_bytes);
+            uint64_t k_exp_off = gpu_scratch_alloc(s, expand_bytes);
+            uint64_t v_off = gpu_scratch_alloc(s, expand_bytes);
+            uint64_t delta_out_off = gpu_scratch_alloc(s, expand_bytes);
+            uint64_t proj_off = gpu_scratch_alloc(s, embd_bytes);
+
+            q4_gpu_tensor *qkv_raw_t = gpu_scratch_view(s, qkv_off, qkv_raw_bytes);
+            q4_gpu_tensor *alpha_raw_t = gpu_scratch_view(s, alpha_off, small_bytes);
+            q4_gpu_tensor *beta_raw_t = gpu_scratch_view(s, beta_off, small_bytes);
+            q4_gpu_tensor *gate_t = gpu_scratch_view(s, gate_off, small_bytes);
+            q4_gpu_tensor *beta_sig_t = gpu_scratch_view(s, beta_sig_off, small_bytes);
+            q4_gpu_tensor *z_raw_t = gpu_scratch_view(s, z_off, z_raw_bytes);
+            q4_gpu_tensor *q_exp_t = gpu_scratch_view(s, q_exp_off, expand_bytes);
+            q4_gpu_tensor *k_exp_t = gpu_scratch_view(s, k_exp_off, expand_bytes);
+            q4_gpu_tensor *v_raw_t = gpu_scratch_view(s, v_off, expand_bytes);
+            q4_gpu_tensor *delta_out_t = gpu_scratch_view(s, delta_out_off, expand_bytes);
+            q4_gpu_tensor *proj_t = gpu_scratch_view(s, proj_off, embd_bytes);
+
+            /* 1. qkv_raw = normed @ attn_qkv (Q4_K) */
+            /* 2. alpha_raw = normed @ ssm_alpha (Q4_K) */
+            /* 3. beta_raw = normed @ ssm_beta (Q4_K) */
+            /* 4. z_raw = normed @ attn_gate (Q4_K) */
+            if (q4_gpu_matmul_q4_k_tensor(qkv_raw_t, model_map, model_size,
+                    l->attn_qkv->abs_offset, n_embd, Q4_QKV_DIM, s->gpu_normed, 1) != 0 ||
+                q4_gpu_matmul_q4_k_tensor(alpha_raw_t, model_map, model_size,
+                    l->ssm_alpha->abs_offset, n_embd, Q4_N_V_HEADS, s->gpu_normed, 1) != 0 ||
+                q4_gpu_matmul_q4_k_tensor(beta_raw_t, model_map, model_size,
+                    l->ssm_beta->abs_offset, n_embd, Q4_N_V_HEADS, s->gpu_normed, 1) != 0 ||
+                q4_gpu_matmul_q4_k_tensor(z_raw_t, model_map, model_size,
+                    l->attn_gate->abs_offset, n_embd, Q4_N_V_HEADS * Q4_HEAD_V_DIM, s->gpu_normed, 1) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u DeltaNet matmuls failed", il);
+                return -1;
+            }
+
+            /* 5. conv1D + split + L2 norm + expand */
+            const uint64_t layer_conv_off = il * Q4_CONV_KERNEL * Q4_QKV_DIM * sizeof(float);
+            q4_gpu_tensor *conv_buf_view = q4_gpu_tensor_view(s->gpu_conv_buf, layer_conv_off,
+                    Q4_CONV_KERNEL * Q4_QKV_DIM * sizeof(float));
+            q4_gpu_tensor *conv_buf_rw_view = q4_gpu_tensor_view(s->gpu_conv_buf, layer_conv_off,
+                    Q4_CONV_KERNEL * Q4_QKV_DIM * sizeof(float));
+
+            if (q4_gpu_deltanet_conv_split_tensor(qkv_raw_t, conv_buf_view, conv_buf_rw_view,
+                    model_map, model_size, l->ssm_conv1d->abs_offset,
+                    q_exp_t, k_exp_t, v_raw_t,
+                    Q4_QKV_DIM, Q4_N_HEAD_KV, Q4_N_V_HEADS,
+                    Q4_HEAD_K_DIM, Q4_HEAD_V_DIM,
+                    Q4_N_V_HEADS / Q4_N_HEAD_KV,
+                    s->conv_pos[il]) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u DeltaNet conv/split failed", il);
+                return -1;
+            }
+
+            /* 6. Gate transform: gate = softplus(alpha+bias)*a, beta = sigmoid(beta) */
+            if (q4_gpu_deltanet_gate_transform_tensor(alpha_raw_t, beta_raw_t,
+                    gate_t, beta_sig_t,
+                    model_map, model_size,
+                    l->ssm_dt_bias->abs_offset, l->ssm_a->abs_offset,
+                    Q4_N_V_HEADS) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u DeltaNet gate transform failed", il);
+                return -1;
+            }
+
+            /* 7. Delta rule */
+            if (q4_gpu_delta_rule_tensor(s->gpu_ssm_state, k_exp_t, v_raw_t,
+                    gate_t, beta_sig_t, delta_out_t,
+                    Q4_N_V_HEADS, Q4_HEAD_V_DIM, Q4_HEAD_K_DIM) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u DeltaNet delta rule failed", il);
+                return -1;
+            }
+
+            /* 8. SiLU + RMS norm */
+            if (q4_gpu_deltanet_silu_rms_tensor(delta_out_t, z_raw_t,
+                    model_map, model_size, l->ssm_norm->abs_offset,
+                    Q4_N_V_HEADS, Q4_HEAD_V_DIM) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u DeltaNet SiLU/RMS failed", il);
+                return -1;
+            }
+
+            /* 9. ssm_out projection: delta_out [6144] -> proj [5120] via Q5_K */
+            if (q4_gpu_vec_matmul_q5k_tensor(proj_t, model_map, model_size,
+                    l->ssm_out->abs_offset,
+                    Q4_N_V_HEADS * Q4_HEAD_V_DIM, n_embd, delta_out_t) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u DeltaNet ssm_out failed", il);
+                return -1;
+            }
+
+            /* 10. Copy proj to gpu_hidden */
+            if (q4_gpu_tensor_copy(s->gpu_hidden, 0, proj_t, 0, embd_bytes) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u DeltaNet copy failed", il);
+                return -1;
+            }
+
+            /* 11. Update conv_pos */
+            s->conv_pos[il] = (s->conv_pos[il] + 1) % Q4_CONV_KERNEL;
+
+            /* 12. Read back SSM state from GPU tensor to CPU (needed for next token / session save) */
+            {
+                float *layer_ssm_state = s->ssm_state + il * Q4_N_V_HEADS * Q4_HEAD_V_DIM * Q4_HEAD_K_DIM;
+                const uint64_t state_bytes = Q4_N_V_HEADS * Q4_HEAD_V_DIM * Q4_HEAD_K_DIM * sizeof(float);
+                const uint64_t layer_state_off = il * state_bytes;
+                q4_gpu_tensor *state_view = q4_gpu_tensor_view(s->gpu_ssm_state, layer_state_off, state_bytes);
+                q4_gpu_tensor_read(state_view, 0, layer_ssm_state, state_bytes);
+            }
+        } else {
+            /* --- Gated Attention --- */
+            /* Allocate scratch for Q, K, V */
+            uint64_t q_off = gpu_scratch_alloc(s, q_bytes);
+            uint64_t k_off = gpu_scratch_alloc(s, kv_bytes);
+            uint64_t v_off = gpu_scratch_alloc(s, kv_bytes);
+            q4_gpu_tensor *q_t = gpu_scratch_view(s, q_off, q_bytes);
+            q4_gpu_tensor *k_t = gpu_scratch_view(s, k_off, kv_bytes);
+            q4_gpu_tensor *v_t = gpu_scratch_view(s, v_off, kv_bytes);
+
+            /* Project Q, K, V from normed input */
+            if (q4_gpu_matmul_any_tensor(q_t, model_map, model_size, l->attn_q->abs_offset,
+                    n_embd, Q4_N_HEAD * Q4_Q_HEAD_DIM, l->attn_q->type, s->gpu_normed, 1) != 0 ||
+                q4_gpu_matmul_any_tensor(k_t, model_map, model_size, l->attn_k->abs_offset,
+                    n_embd, Q4_N_HEAD_KV * Q4_HEAD_DIM, l->attn_k->type, s->gpu_normed, 1) != 0 ||
+                q4_gpu_matmul_any_tensor(v_t, model_map, model_size, l->attn_v->abs_offset,
+                    n_embd, Q4_N_HEAD_KV * Q4_HEAD_DIM, l->attn_v->type, s->gpu_normed, 1) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u QKV projection failed", il);
+                return -1;
+            }
+
+            /* Apply RoPE to Q and K */
+            if (q4_gpu_rope_full_tensor(q_t, 1, Q4_N_HEAD, Q4_Q_HEAD_DIM, pos, e->rope_freq_base, 1.0f) != 0 ||
+                q4_gpu_rope_full_tensor(k_t, 1, Q4_N_HEAD_KV, Q4_HEAD_DIM, pos, e->rope_freq_base, 1.0f) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u RoPE failed", il);
+                return -1;
+            }
+
+            /* Store K, V to KV cache at position pos */
+            uint64_t cache_k_off = (uint64_t)pos * kv_head_bytes;
+            uint64_t cache_v_off = (uint64_t)pos * kv_head_bytes;
+            q4_gpu_tensor *cache_k_view = q4_gpu_tensor_view(s->gpu_kv_k, cache_k_off, kv_bytes);
+            q4_gpu_tensor *cache_v_view = q4_gpu_tensor_view(s->gpu_kv_v, cache_v_off, kv_bytes);
+
+            if (q4_gpu_kv_cache_store_tensor(k_t, v_t, cache_k_view, cache_v_view,
+                    0, Q4_N_HEAD_KV, Q4_HEAD_DIM) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u KV cache store failed", il);
+                return -1;
+            }
+
+            /* Flash Attention: q_t -> gpu_hidden (output) */
+            /* Need scratch for attention output */
+            uint64_t attn_out_off = gpu_scratch_alloc(s, embd_bytes);
+            q4_gpu_tensor *attn_out = gpu_scratch_view(s, attn_out_off, embd_bytes);
+
+            if (q4_gpu_flash_attn_tensor(attn_out, model_map, model_size,
+                    q4_gpu_tensor_offset(q_t), q4_gpu_tensor_offset(k_t), q4_gpu_tensor_offset(v_t),
+                    s->gpu_kv_k, s->gpu_kv_v,
+                    Q4_N_HEAD, Q4_N_HEAD_KV, Q4_HEAD_DIM,
+                    1, pos, s->kv_len + 1, e->logit_softcap) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u flash attention failed", il);
+                return -1;
+            }
+
+            /* Increment KV cache length */
+            s->kv_len++;
+
+            /* Post-norm on attention output: normed = rms_norm(attn_out) */
+            if (q4_gpu_rms_norm_weight_rows_tensor(s->gpu_normed, attn_out,
+                    model_map, model_size, l->post_attn_norm->abs_offset, n_embd, 1, Q4_RMS_EPS) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u post-norm failed", il);
+                return -1;
+            }
+
+            /* Residual: hidden = attn_out + residual (input to layer) */
+            if (q4_gpu_tensor_copy(s->gpu_hidden, 0, attn_out, 0, embd_bytes) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u attn output copy failed", il);
+                return -1;
+            }
+            if (q4_gpu_residual_add_tensor(s->gpu_hidden, s->gpu_residual, n_embd) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u residual add failed", il);
+                return -1;
+            }
+
+            /* Update residual for FFN residual */
+            if (q4_gpu_tensor_copy(s->gpu_residual, 0, s->gpu_hidden, 0, embd_bytes) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u attn residual copy failed", il);
+                return -1;
+            }
+
+            /* Skip the shared post-norm/residual section below — already done above */
+            goto skip_post_attn_norm;
+        }
+
+        /* --- Post-attention/post-SSM norm + residual --- */
+        {
+            uint64_t post_norm_w_offset = l->post_attn_norm->abs_offset;
+            if (q4_gpu_rms_norm_weight_rows_tensor(s->gpu_normed, s->gpu_hidden,
+                    model_map, model_size, post_norm_w_offset, n_embd, 1, Q4_RMS_EPS) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u post-norm failed", il);
+                return -1;
+            }
+
+            /* Residual add: hidden = normed + residual */
+            /* First copy residual (pre-layer hidden) to gpu_hidden */
+            if (q4_gpu_tensor_copy(s->gpu_hidden, 0, s->gpu_residual, 0, embd_bytes) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u residual copy failed", il);
+                return -1;
+            }
+            /* Then add normed (post-norm output) to hidden */
+            if (q4_gpu_residual_add_tensor(s->gpu_hidden, s->gpu_normed, n_embd) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u residual add failed", il);
+                return -1;
+            }
+
+            /* Update residual = hidden for next residual connection */
+            if (q4_gpu_tensor_copy(s->gpu_residual, 0, s->gpu_hidden, 0, embd_bytes) != 0) {
+                if (err && errlen > 0) snprintf(err, errlen, "layer %u residual copy failed", il);
+                return -1;
+            }
+        }
+
+skip_post_attn_norm:
+        /* --- FFN --- */
+        /* Norm again for FFN input */
+        if (q4_gpu_rms_norm_weight_rows_tensor(s->gpu_normed, s->gpu_hidden,
+                model_map, model_size, l->post_attn_norm->abs_offset, n_embd, 1, Q4_RMS_EPS) != 0) {
+            if (err && errlen > 0) snprintf(err, errlen, "layer %u FFN pre-norm failed", il);
+            return -1;
+        }
+
+        /* FFN: gate = normed @ ffn_gate (Q4_K), up = normed @ ffn_up (Q4_K)
+         * mid = SiLU(clamp(gate)) * up, then ffn_out = mid @ ffn_down
+         * Since shared kernel only supports Q8_0, do separate matmuls + elementwise. */
+        uint64_t gate_off = gpu_scratch_alloc(s, ffn_bytes);
+        uint64_t up_off = gpu_scratch_alloc(s, ffn_bytes);
+        q4_gpu_tensor *gate_t = gpu_scratch_view(s, gate_off, ffn_bytes);
+        q4_gpu_tensor *up_t = gpu_scratch_view(s, up_off, ffn_bytes);
+
+        if (q4_gpu_matmul_any_tensor(gate_t, model_map, model_size, l->ffn_gate->abs_offset,
+                n_embd, Q4_N_FFN, l->ffn_gate->type, s->gpu_normed, 1) != 0 ||
+            q4_gpu_matmul_any_tensor(up_t, model_map, model_size, l->ffn_up->abs_offset,
+                n_embd, Q4_N_FFN, l->ffn_up->type, s->gpu_normed, 1) != 0) {
+            if (err && errlen > 0) snprintf(err, errlen, "layer %u FFN gate/up failed", il);
+            return -1;
+        }
+
+        /* Fused SiLU+mul on GPU: gate_t = SiLU(clamp(gate_t)) * up_t */
+        if (q4_gpu_silu_clamped_mul_tensor(gate_t, gate_t, up_t, Q4_N_FFN, 10.0f) != 0) {
+            if (err && errlen > 0) snprintf(err, errlen, "layer %u FFN SiLU+mul failed", il);
+            return -1;
+        }
+
+        /* ffn_down: mid -> ffn_out */
+        uint64_t ffn_out_off = gpu_scratch_alloc(s, embd_bytes);
+        q4_gpu_tensor *ffn_out_t = gpu_scratch_view(s, ffn_out_off, embd_bytes);
+
+        if (q4_gpu_matmul_any_tensor(ffn_out_t, model_map, model_size, l->ffn_down->abs_offset,
+                Q4_N_FFN, n_embd, l->ffn_down->type, gate_t, 1) != 0) {
+            if (err && errlen > 0) snprintf(err, errlen, "layer %u FFN down failed", il);
+            return -1;
+        }
+
+        /* Residual add: hidden = ffn_out + hidden */
+
+        if (q4_gpu_residual_add_tensor(s->gpu_hidden, ffn_out_t, n_embd) != 0) {
+            if (err && errlen > 0) snprintf(err, errlen, "layer %u FFN residual failed", il);
+            return -1;
+        }
+
+        /* Update residual = hidden */
+        if (q4_gpu_tensor_copy(s->gpu_residual, 0, s->gpu_hidden, 0, embd_bytes) != 0) {
+            if (err && errlen > 0) snprintf(err, errlen, "layer %u FFN residual copy failed", il);
+            return -1;
+        }
+
+        if (il % 16 == 0) fprintf(stderr, "GPU_DBG: layer %u done\n", il);
+    }
+
+    fprintf(stderr, "GPU_DBG: all layers done\n");
+
+    /* --- Final RMSNorm --- */
+    if (q4_gpu_rms_norm_weight_rows_tensor(s->gpu_normed, s->gpu_hidden,
+            e->model.map, e->model.size, e->weights.output_norm->abs_offset, n_embd, 1, Q4_RMS_EPS) != 0) {
+        if (err && errlen > 0) snprintf(err, errlen, "final RMSNorm failed");
+        return -1;
+    }
+
+    /* --- Output projection: normed -> logits --- */
+    if (q4_gpu_matmul_any_tensor(s->gpu_logits, e->model.map, e->model.size,
+            e->weights.output->abs_offset, n_embd, e->config.n_vocab,
+            e->weights.output->type, s->gpu_normed, 1) != 0) {
+        if (err && errlen > 0) snprintf(err, errlen, "output projection failed");
+        return -1;
+    }
+
+    /* Flush commands */
+    if (q4_gpu_flush_commands() != 0) {
+        if (err && errlen > 0) snprintf(err, errlen, "failed to flush GPU commands");
+        return -1;
+    }
+
+    /* Read logits back to CPU */
+    uint64_t logits_bytes = (uint64_t)e->config.n_vocab * sizeof(float);
+    if (q4_gpu_tensor_read(s->gpu_logits, 0, s->logits, logits_bytes) != 0) {
+        if (err && errlen > 0) snprintf(err, errlen, "failed to read logits");
+        return -1;
+    }
+
+    /* Debug: print some logits stats */
+    float max_logit = -1e30f;
+    int max_idx = 0;
+    for (uint64_t i = 0; i < e->config.n_vocab; i++) {
+        if (s->logits[i] > max_logit) {
+            max_logit = s->logits[i];
+            max_idx = (int)i;
+        }
+    }
+
+    return 0;
+}
+#endif /* Q4_NO_GPU */
 
 /* =========================================================================
  * Session Sync: evaluate a prompt prefix, reusing KV cache where possible.
@@ -2200,9 +3150,17 @@ int q4_session_sync(q4_session *s, const q4_tokens *prompt, char *err, size_t er
 
 #ifndef Q4_NO_GPU
     if (q4_backend_uses_graph(e->backend)) {
-        // GPU path: build and execute compute graph
-        if (err && errlen > 0) snprintf(err, errlen, "GPU inference path not yet implemented");
-        return -1;
+        /* GPU path: process tokens one by one on GPU */
+        s->n_tokens = 0;
+        s->kv_len = 0;
+
+        for (int i = 0; i < prompt->len; i++) {
+            s->tokens[s->n_tokens++] = prompt->v[i];
+            if (q4_gpu_forward(e, s, prompt->v[i], (uint32_t)i, err, errlen) != 0) {
+                return -1;
+            }
+        }
+        return 0;
     }
 #endif
 
@@ -2231,8 +3189,15 @@ int q4_session_eval(q4_session *s, int token, char *err, size_t errlen) {
 
 #ifndef Q4_NO_GPU
     if (q4_backend_uses_graph(e->backend)) {
-        if (err && errlen > 0) snprintf(err, errlen, "GPU inference path not yet implemented");
-        return -1;
+        /* GPU path: forward pass on GPU */
+        uint32_t pos = s->kv_len;
+        if (q4_gpu_forward(e, s, token, pos, err, errlen) != 0) {
+            return -1;
+        }
+        if (s->n_tokens < s->ctx_size) {
+            s->tokens[s->n_tokens++] = token;
+        }
+        return 0;
     }
 #endif
 
@@ -2303,12 +3268,16 @@ int q4_engine_generate_argmax(q4_engine *e, const q4_tokens *prompt,
     // Generate
     for (int i = 0; i < n_predict; i++) {
         int token = q4_session_argmax(s, err, sizeof(err));
+        fprintf(stderr, "GEN_DBG: argmax returned token=%d\n", token);
         if (token < 0) {
             fprintf(stderr, "q4: argmax failed: %s\n", err);
             break;
         }
 
-        if (emit) emit(emit_ud, token);
+        if (emit) {
+            fprintf(stderr, "GEN_DBG: calling emit with token=%d\n", token);
+            emit(emit_ud, token);
+        }
 
         if (q4_session_eval(s, token, err, sizeof(err)) != 0) {
             fprintf(stderr, "q4: eval failed: %s\n", err);
